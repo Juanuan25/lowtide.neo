@@ -46,17 +46,8 @@
               server to find them.
             '';
           }
-          {
-            assertion = cfg.hostId != null && builtins.match "[0-9a-f]{8}" cfg.hostId != null;
-            message = ''
-              neo.services.storage-disks: hostId must be exactly 8 lowercase hex
-              characters. Generate once with:
-              head -c4 /dev/urandom | od -A none -t x4 | tr -d ' '
-            '';
-          }
         ];
 
-        networking.hostId = cfg.hostId;
         boot.supportedFilesystems = ["zfs"];
 
         services.zfs.autoScrub = {

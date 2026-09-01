@@ -30,17 +30,6 @@
                 default = "/mnt/backups";
                 description = "Where <poolName>/<dataset> is mounted (managed by NixOS, not ZFS's own mountpoint property).";
               };
-              hostId = mkOption {
-                type = types.nullOr types.str;
-                default = null;
-                example = "8f2a91c3";
-                description = ''
-                  Value for networking.hostId, required by ZFS to prevent a pool being
-                  imported on the wrong machine. Generate once with:
-                  head -c4 /dev/urandom | od -A none -t x4 | tr -d ' '
-                  Must stay the same for the lifetime of this pool.
-                '';
-              };
               ssd1 = {
                 device = mkOption {
                   type = types.str;
@@ -79,10 +68,11 @@
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
                 Configures ZFS import/mount for a mirrored pool across two attached
-                SSDs. This does not take snapshots or replicate: enable the sanoid
-                and syncoid services for backup policy. Pool creation is destructive
-                and is not automatic; a guarded `storage-disks-bootstrap-pool --yes`
-                script creates the pool/dataset once after the by-id paths are set.
+                SSDs. networking.hostId is left to Neo Disko. This does not take
+                snapshots or replicate: enable the sanoid and syncoid services for
+                backup policy. Pool creation is destructive and is not automatic;
+                a guarded `storage-disks-bootstrap-pool --yes` script creates the
+                pool/dataset once after the by-id paths are set.
               '';
             };
         };
