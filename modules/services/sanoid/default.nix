@@ -1,0 +1,47 @@
+# Implementation: NixOS services.sanoid snapshot policy.
+{...}: {
+  flake.modules.nixos.sanoid = {
+    config,
+    lib,
+    ...
+  }:
+    with lib; let
+      cfg = config.neo.services.sanoid;
+      disks = config.neo.services.storage-disks;
+      dataset =
+        if cfg.dataset != ""
+        then cfg.dataset
+        else if disks.enabled or false
+        then "${disks.poolName}/${disks.dataset}"
+        else "";
+    in {
+      config = mkIf cfg.enabled {
+        assertions = [
+          {
+            assertion = dataset != "";
+            message = ''
+              neo.services.sanoid: dataset must be set, or enable
+              neo.services.storage-disks so the backup dataset can be used.
+            '';
+          }
+        ];
+
+        services.sanoid = {
+          enable = true;
+          interval = cfg.interval;
+          datasets.${dataset} = {
+            use_template = ["backup"];
+            recursive = cfg.recursive;
+          };
+          templates.backup = {
+            hourly = cfg.hourly;
+            daily = cfg.daily;
+            monthly = cfg.monthly;
+            yearly = cfg.yearly;
+            autosnap = cfg.autosnap;
+            autoprune = cfg.autoprune;
+          };
+        };
+      };
+    };
+}

@@ -69,7 +69,7 @@
                 };
                 interval = mkOption {
                   type = types.str;
-                  default = "Sun *-*-* 02:00:00";
+                  default = "*-*-* 02:00:00";
                   description = "systemd calendar expression for the scrub timer.";
                 };
               };
@@ -79,11 +79,10 @@
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
                 Configures ZFS import/mount for a mirrored pool across two attached
-                SSDs, used as the backup destination. Pool creation itself is
-                destructive and is intentionally NOT automatic: enabling this option
-                only wires up NixOS's side (hostId, zfs support, mount, scrub).
-                A guarded `storage-disks-bootstrap-pool --yes` script is installed to
-                create the pool/dataset once, after the by-id device paths are set.
+                SSDs. This does not take snapshots or replicate: enable the sanoid
+                and syncoid services for backup policy. Pool creation is destructive
+                and is not automatic; a guarded `storage-disks-bootstrap-pool --yes`
+                script creates the pool/dataset once after the by-id paths are set.
               '';
             };
         };
