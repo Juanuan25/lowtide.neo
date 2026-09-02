@@ -216,6 +216,7 @@
         boot.zfs.extraPools = [pool];
         boot.zfs.forceImportAll = mkDefault true;
         boot.zfs.devNodes = "/dev/disk/by-id";
+        boot.zfs.requestEncryptionCredentials = [pool];
 
         # Do not let a late USB disk stall or fail the boot target.
         systemd.services."zfs-import-${pool}" = {
@@ -244,9 +245,7 @@
           unitConfig = {
             StartLimitIntervalSec = 300;
             StartLimitBurst = 12;
-          }
           };
-          unitConfig.StartLimitIntervalSec = 0;
         };
 
         services.zfs.autoScrub = {

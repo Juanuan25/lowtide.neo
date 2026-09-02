@@ -83,21 +83,21 @@
                   description = "Enable periodic zpool scrub via services.zfs.autoScrub.";
                 };
                 interval = mkOption {
-                  type = types.str;encrypted datadisk mirror on boot (force
-                import, by-id, USB retry, load-key from keyFile). Native mounts
-                stay at /mnt/external_ssd — no NixOS fileSystems entry, so a
-                missing USB disk cannot block boot. Replace a dead disk with:
-               
+                  type = types.str;
+                  default = "*-*-* 02:00:00";
+                  description = "systemd calendar expression for the scrub timer.";
+                };
+              };
             }
             // lib.neo.mkServiceMeta {
               category = "Storage";
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
-                Imports the existing datadisk mirror on boot (force import, by-id
-                device nodes, USB retry). Keeps native ZFS mounts at
-                /mnt/external_ssd and /mnt/external_ssd/backups — no NixOS
-                fileSystems entry, so a missing USB disk cannot block boot.
-                Replace a dead disk with: storage-disks-replace --yes /dev/disk/by-id/<new>.
+                Imports the existing encrypted datadisk mirror on boot (force
+                import, by-id, USB retry, load-key from keyFile). Native mounts
+                stay at /mnt/external_ssd — no NixOS fileSystems entry, so a
+                missing USB disk cannot block boot. Replace a dead disk with:
+                storage-disks-replace --yes /dev/disk/by-id/<new>.
                 mode=format only unlocks storage-disks-format --yes.
               '';
             };
