@@ -17,9 +17,9 @@
               };
               dataset = mkOption {
                 type = types.str;
-                default = "";
-                example = "backup/backups";
-                description = "ZFS dataset to snapshot. Empty uses storage-disks poolName/dataset when that service is enabled.";
+                default = "zroot";
+                example = "zroot";
+                description = "ZFS dataset to snapshot (this host: zroot, the system pool).";
                 rank = 10;
               };
               recursive = mkOption {
@@ -76,9 +76,10 @@
               category = "Storage";
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
-                Runs Sanoid on a timer to take and prune ZFS snapshots.
-                Point it at the storage-disks dataset (or any other dataset) and set
-                how many hourly/daily/monthly/yearly snapshots to keep.
+                Runs Sanoid on a timer to take and prune ZFS snapshots of zroot
+                (the system pool). Pair with syncoid to replicate those snapshots
+                onto datadisk/backups. Set how many hourly/daily/monthly/yearly
+                snapshots to keep.
               '';
               projectUrl = "https://github.com/jimsalterjrs/sanoid";
               githubUrl = "https://github.com/jimsalterjrs/sanoid";

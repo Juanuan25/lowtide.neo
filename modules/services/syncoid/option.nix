@@ -17,16 +17,16 @@
               };
               source = mkOption {
                 type = types.str;
-                default = "";
-                example = "backup/backups";
-                description = "Source ZFS dataset. Empty uses storage-disks poolName/dataset when that service is enabled.";
+                default = "zroot";
+                example = "zroot";
+                description = "Source ZFS dataset to replicate (this host: zroot). Empty uses neo.services.sanoid.dataset.";
                 rank = 10;
               };
               target = mkOption {
                 type = types.str;
                 default = "";
-                example = "user@host:pool/backups";
-                description = "Target dataset. Local (pool/dataset) or remote (user@host:pool/dataset).";
+                example = "datadisk/backups";
+                description = "Target dataset. Empty uses storage-disks poolName/dataset (datadisk/backups). Local (pool/dataset) or remote (user@host:pool/dataset).";
                 rank = 20;
               };
               recursive = mkOption {
@@ -61,10 +61,9 @@
               category = "Storage";
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
-                Runs Syncoid on a timer to replicate a ZFS dataset (typically the
-                storage-disks backup pool) to another local or remote dataset.
-                Pair with sanoid so snapshots exist before replication; extraArgs
-                defaults to --no-sync-snap so Sanoid snapshots are used.
+                Runs Syncoid on a timer to replicate zroot (Sanoid snapshots)
+                onto datadisk/backups. extraArgs defaults to --no-sync-snap so
+                Sanoid snapshots are used instead of creating syncoid's own.
               '';
               projectUrl = "https://github.com/jimsalterjrs/sanoid";
               githubUrl = "https://github.com/jimsalterjrs/sanoid";

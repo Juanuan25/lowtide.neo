@@ -7,22 +7,13 @@
   }:
     with lib; let
       cfg = config.neo.services.sanoid;
-      disks = config.neo.services.storage-disks;
-      dataset =
-        if cfg.dataset != ""
-        then cfg.dataset
-        else if disks.enabled or false
-        then "${disks.poolName}/${disks.dataset}"
-        else "";
+      dataset = cfg.dataset;
     in {
       config = mkIf cfg.enabled {
         assertions = [
           {
             assertion = dataset != "";
-            message = ''
-              neo.services.sanoid: dataset must be set, or enable
-              neo.services.storage-disks so the backup dataset can be used.
-            '';
+            message = "neo.services.sanoid: dataset must be set (default is zroot).";
           }
         ];
 

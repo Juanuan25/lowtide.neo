@@ -8,9 +8,14 @@
     with lib; let
       cfg = config.neo.services.syncoid;
       disks = config.neo.services.storage-disks;
+      sanoid = config.neo.services.sanoid or {};
       source =
         if cfg.source != ""
         then cfg.source
+        else sanoid.dataset or "zroot";
+      target =
+        if cfg.target != ""
+        then cfg.target
         else if disks.enabled or false
         then "${disks.poolName}/${disks.dataset}"
         else "";
@@ -19,14 +24,14 @@
         assertions = [
           {
             assertion = source != "";
-            message = ''
-              neo.services.syncoid: source must be set, or enable
-              neo.services.storage-disks so the backup dataset can be used.
-            '';
+            message = "neo.services.syncoid: source must be set (default is zroot).";
           }
           {
-            assertion = cfg.target != "";
-            message = "neo.services.syncoid: target must be set to a local or remote dataset.";
+            assertion = target != "";
+            message = ''
+              neo.services.syncoid: target must be set, or enable
+              neo.services.storage-disks so datadisk/backups can be used.
+            '';
           }
         ];
 
@@ -38,11 +43,17 @@
             then cfg.sshKey
             else null;
           commands.backup = {
-            inherit source;
-            target = cfg.target;
+            inherit source target;
             recursive = cfg.recursive;
             extraArgs = cfg.extraArgs;
           };
+        };
+
+        systemd.services.syncoid-backup = {
+          after =
+            optional (disks.enabled or false) "storage-disks-ensure-imported.service"
+            ++ optional (sanoid.enabled or false) "sanoid.service";
+          requires = optional (disks.enabled or false) "storage-disks-ensure-imported.service";
         };
       };
     };
