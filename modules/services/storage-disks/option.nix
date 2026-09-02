@@ -1,4 +1,4 @@
-# Options: two attached SSDs as a ZFS mirror, dataset mounted for backups.
+# Options: import the existing datadisk mirror (or format new disks).
 # Operator values live in Neo settings.toml / the web UI, not in this plugin.
 {...}: {
   flake.modules.nixos.storage-disks-option = {
@@ -12,43 +12,69 @@
         type = types.submodule {
           options =
             {
-              enabled = mkEnableOption "ZFS mirror across two attached SSDs, mounted as the backup destination" {
+              enabled = mkEnableOption "ZFS pool on attached disks, mounted as the backup destination" {
                 rank = 0;
+              };
+              mode = mkOption {
+                type = types.enum ["import" "format"];
+                default = "import";
+                description = ''
+                  import: import poolName on every boot (never wipes disks).
+                  format: unlocks storage-disks-format --yes only; never runs on activate.
+                '';
+                rank = 10;
               };
               poolName = mkOption {
                 type = types.str;
-                default = "backup";
-                description = "Name of the zpool spanning both disks.";
+                default = "datadisk";
+                description = "ZFS pool name. Must match `zpool import` (this host: datadisk).";
+                rank = 20;
               };
               dataset = mkOption {
                 type = types.str;
                 default = "backups";
-                description = "Dataset created under the pool (i.e. <poolName>/<dataset>).";
+                description = "Dataset under the pool (<poolName>/<dataset>).";
+                rank = 30;
+              };
+              poolMountPoint = mkOption {
+                type = types.str;
+                default = "/mnt/external_ssd";
+                description = "Native ZFS mountpoint of the pool root. Matches the existing datadisk property.";
+                rank = 40;
               };
               mountPoint = mkOption {
                 type = types.str;
-                default = "/mnt/backups";
-                description = "Where <poolName>/<dataset> is mounted (managed by NixOS, not ZFS's own mountpoint property).";
+                default = "/mnt/external_ssd/backups";
+                description = "Native ZFS mountpoint of <poolName>/<dataset>. Not a NixOS fileSystems entry.";
+                rank = 50;
               };
-              ssd1 = {
-                device = mkOption {
-                  type = types.str;
-                  default = "";
-                  example = "/dev/disk/by-id/ata-Samsung_SSD_870_EVO_1TB_S5XXXXXXXXXXXX";
-                  description = ''
-                    Stable device path for the first disk (currently /dev/sdb).
-                    Always use /dev/disk/by-id/*, never /dev/sdX (letters can change
-                    across reboots). List candidates with: ls -l /dev/disk/by-id/
-                  '';
-                };
+              devices = mkOption {
+                type = types.listOf types.str;
+                default = [
+                  "/dev/disk/by-id/usb-Samsung_PSSD_T7_S5TNNK0N412932P-0:0"
+                  "/dev/disk/by-id/ata-Hitachi_HTS545050A7E380_TA95123V059NEX"
+                ];
+                description = ''
+                  Mirror members as /dev/disk/by-id/* paths (never /dev/sdX).
+                  Used by storage-disks-replace and by format. Import is by pool name.
+                '';
+                rank = 60;
               };
-              ssd2 = {
-                device = mkOption {
-                  type = types.str;
-                  default = "";
-                  example = "/dev/disk/by-id/ata-Samsung_SSD_870_EVO_1TB_S5YYYYYYYYYYYY";
-                  description = "Stable device path for the second disk (currently /dev/sdc). See ssd1.device.";
-                };
+              keyFile = mkOption {
+                type = types.str;
+                default = "/root/keys/datadisk.key";
+                description = ''
+                  Raw ZFS wrapping key for poolName (keylocation=file://…).
+                  Must exist on this host; not stored in the nix store.
+                  Loaded after import so native mounts work across reboot.
+                '';
+                rank = 70;
+              };
+              layout = mkOption {
+                type = types.enum ["mirror" "stripe"];
+                default = "mirror";
+                description = "vdev layout used only when mode=format. mirror needs two or more devices.";
+                rank = 80;
               };
               autoScrub = {
                 enable = mkOption {
@@ -57,27 +83,27 @@
                   description = "Enable periodic zpool scrub via services.zfs.autoScrub.";
                 };
                 interval = mkOption {
-                  type = types.str;
-                  default = "*-*-* 02:00:00";
-                  description = "systemd calendar expression for the scrub timer.";
-                };
-              };
+                  type = types.str;encrypted datadisk mirror on boot (force
+                import, by-id, USB retry, load-key from keyFile). Native mounts
+                stay at /mnt/external_ssd — no NixOS fileSystems entry, so a
+                missing USB disk cannot block boot. Replace a dead disk with:
+               
             }
             // lib.neo.mkServiceMeta {
               category = "Storage";
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
-                Configures ZFS import/mount for a mirrored pool across two attached
-                SSDs. networking.hostId is left to Neo Disko. This does not take
-                snapshots or replicate: enable the sanoid and syncoid services for
-                backup policy. Pool creation is destructive and is not automatic;
-                a guarded `storage-disks-bootstrap-pool --yes` script creates the
-                pool/dataset once after the by-id paths are set.
+                Imports the existing datadisk mirror on boot (force import, by-id
+                device nodes, USB retry). Keeps native ZFS mounts at
+                /mnt/external_ssd and /mnt/external_ssd/backups — no NixOS
+                fileSystems entry, so a missing USB disk cannot block boot.
+                Replace a dead disk with: storage-disks-replace --yes /dev/disk/by-id/<new>.
+                mode=format only unlocks storage-disks-format --yes.
               '';
             };
         };
         default = {};
-        description = "ZFS mirror across two attached SSDs for backups";
+        description = "ZFS pool on attached disks for backups";
       };
     };
 }
