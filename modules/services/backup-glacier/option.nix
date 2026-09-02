@@ -17,8 +17,8 @@
               };
               sourcePath = mkOption {
                 type = types.str;
-                default = "/mnt/backups";
-                description = "Local directory to back up, e.g. neo.services.storage-disks.mountPoint.";
+                default = "/mnt/external_ssd/backups";
+                description = "Local directory to back up (datadisk/backups native mount).";
               };
               bucket = mkOption {
                 type = types.str;
