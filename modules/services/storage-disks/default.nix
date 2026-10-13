@@ -319,6 +319,28 @@
           exit 1
         fi
 
+        # zpool create refuses a mountpoint directory that already has
+        # anything in it. The old pool's directory is left behind after
+        # destroy. It is not a mount anymore; move it aside.
+        ready_mount() {
+          mp=$1
+          covered=$(findmnt -n -o TARGET -T "$mp" 2>/dev/null || true)
+          if [ "$covered" = "$mp" ]; then
+            echo "$mp is still mounted. Format stopped before create." >&2
+            exit 1
+          fi
+          if [ -d "$mp" ] && [ -n "$(ls -A "$mp" 2>/dev/null || true)" ]; then
+            aside="$mp.before-format"
+            if [ -e "$aside" ]; then
+              aside="$mp.before-format.$(date +%Y%m%d%H%M%S)"
+            fi
+            echo "Moving leftover $mp to $aside"
+            mv "$mp" "$aside"
+          fi
+          mkdir -p "$mp"
+        }
+        ready_mount "$pool_mnt"
+
         case "$layout" in
           mirror)
             zpool create "''${create_args[@]}" "$pool" mirror "''${devices[@]}"
