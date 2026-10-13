@@ -23,8 +23,10 @@
                   import: on boot, import poolName if its disks are attached.
                   Never wipes disks. A missing pool does not fail boot.
                   format: does not touch disks on activate. It only unlocks
-                  `storage-disks-format --yes`, which creates the pool, the
-                  dataset, and the mountpoints. Set this back to import after.
+                  `storage-disks-format --yes`, which destroys an existing pool
+                  of this same name (if one is imported or exported), then
+                  creates the pool, the dataset, and the mountpoints.
+                  Set this back to import after.
                 '';
                 rank = 10;
               };
@@ -133,8 +135,8 @@
                 To put new disks into service: set devices to stable
                 /dev/disk/by-id/* paths, choose encryption and layout, set
                 mode=format, apply, then run `storage-disks-format --yes`.
-                That wipes those disks, creates the pool and dataset, and
-                mounts them. Set mode back to import and apply.
+                That destroys an existing pool of this name, creates the new
+                pool and dataset, and mounts them. Set mode back to import and apply.
                 Replace a dead mirror disk with:
                 storage-disks-replace --yes /dev/disk/by-id/<new>.
               '';

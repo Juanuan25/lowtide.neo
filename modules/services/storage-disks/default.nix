@@ -85,26 +85,57 @@
             echo "Device $d not found. Use /dev/disk/by-id/* paths." >&2
             exit 1
           fi
-          real=$(readlink -f "$d" || echo "$d")
-          if lsblk -no MOUNTPOINT "$d" 2>/dev/null | grep -q '[^[:space:]]'; then
-            echo "Device $d (or a partition on it) is mounted. Unmount it first." >&2
-            exit 1
-          fi
-          if zpool status -P 2>/dev/null | grep -F -q "$d" || zpool status -P 2>/dev/null | grep -F -q "$real"; then
-            echo "Device $d belongs to a pool that is already imported. Refusing to format." >&2
-            zpool status >&2
+          # ZFS mounts of this pool are expected. Anything else means the disk
+          # is in use by a different filesystem.
+          while read -r mp; do
+            [ -n "$mp" ] || continue
+            case "$mp" in
+              "$pool_mnt"|"$ds_mnt"|"$pool_mnt"/*|"$ds_mnt"/*) ;;
+              *)
+                echo "Device $d is mounted at $mp, not under $pool_mnt. Refusing to format." >&2
+                exit 1
+                ;;
+            esac
+          done < <(lsblk -no MOUNTPOINT "$d" 2>/dev/null || true)
+        done
+
+        # Which imported pool, if any, is using this disk (whole disk or its ZFS partition).
+        pool_of_device() {
+          dev="$1"
+          real=$(readlink -f "$dev" || echo "$dev")
+          for p in $(zpool list -H -o name 2>/dev/null); do
+            for v in $(zpool status -P "$p" 2>/dev/null | awk '$1 ~ /^\// { print $1 }'); do
+              case "$v" in
+                "$dev"|"$real"|"$dev"-part*|"$dev"p[0-9]*|"$real"[0-9]*|"$real"p[0-9]*)
+                  echo "$p"
+                  return 0
+                  ;;
+              esac
+            done
+          done
+          return 1
+        }
+
+        pool_is_importable() {
+          zpool import -d /dev/disk/by-id 2>/dev/null | awk -v p="$pool" '$1 == "pool:" && $2 == p { found = 1 } END { exit !found }'
+        }
+
+        for d in "''${devices[@]}"; do
+          owner=$(pool_of_device "$d" || true)
+          if [ -n "$owner" ] && [ "$owner" != "$pool" ]; then
+            echo "Device $d is part of imported pool '$owner', not '$pool'." >&2
+            echo "Refusing to format a disk that belongs to a different pool." >&2
+            zpool status "$owner" >&2
             exit 1
           fi
         done
 
-        if zpool list "$pool" >/dev/null 2>&1; then
-          echo "zpool $pool is already imported. Export it first, or keep mode=import." >&2
-          exit 1
+        rootpool=""
+        if findmnt -n -t zfs / >/dev/null 2>&1; then
+          rootpool=$(findmnt -n -o SOURCE / | cut -d/ -f1)
         fi
-
-        if zpool import -d /dev/disk/by-id 2>/dev/null | awk -v p="$pool" '$1 == "pool:" && $2 == p { found = 1 } END { exit !found }'; then
-          echo "zpool '$pool' is already on disk. Set mode=import instead of formatting." >&2
-          echo "Import does not wipe anything." >&2
+        if [ -n "$rootpool" ] && [ "$rootpool" = "$pool" ]; then
+          echo "Refusing to format: '$pool' is the root pool." >&2
           exit 1
         fi
 
@@ -113,19 +144,46 @@
           exit 1
         fi
 
+        existing=0
+        if zpool list "$pool" >/dev/null 2>&1 || pool_is_importable; then
+          existing=1
+        fi
+
         if [ "''${1:-}" != "--yes" ]; then
           echo "This DESTROYS all data on:" >&2
           printf '  %s\n' "''${devices[@]}" >&2
           echo "and creates zpool '$pool' (layout=$layout, encryption=$encryption)." >&2
           echo "Dataset $pool/$dataset will be mounted at $ds_mnt." >&2
+          if [ "$existing" = 1 ]; then
+            echo "Existing pool '$pool' will be destroyed first, including any encrypted data on it." >&2
+            echo "Export alone is not enough; this command destroys it." >&2
+          fi
           if [ "$encryption" = "keyfile" ]; then
             echo "Key file: $keyfile (created if it does not exist yet)." >&2
           else
-            echo "The pool will NOT be encrypted." >&2
+            echo "The new pool will NOT be encrypted." >&2
           fi
           echo "Re-run as: storage-disks-format --yes" >&2
           exit 1
         fi
+
+        # The retry timer imports this pool. Stop it so it cannot revive the
+        # old pool between destroy and create.
+        systemctl stop storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
+        trap 'systemctl start storage-disks-ensure-imported.timer >/dev/null 2>&1 || true' EXIT
+
+        if [ "$existing" = 1 ]; then
+          if ! zpool list "$pool" >/dev/null 2>&1; then
+            echo "Importing exported pool $pool so it can be destroyed..."
+            zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool"
+          fi
+          echo "Destroying pool $pool. Data on it will be gone."
+          zpool destroy -f "$pool"
+        fi
+
+        for d in "''${devices[@]}"; do
+          zpool labelclear -f "$d" 2>/dev/null || true
+        done
 
         create_args=(
           -f
