@@ -181,10 +181,9 @@
           exit 1
         fi
 
-        # The retry timer imports this pool. Stop it so it cannot revive the
-        # old pool between destroy and create. systemctl start without
-        # --no-block deadlocks here: systemd is waiting for this start job,
-        # and systemctl waits for systemd. That is the two minute timeout.
+        # Stop the importer so it cannot mount the pool again under us.
+        # systemctl start without --no-block deadlocks: systemd is waiting
+        # for this job, and a blocking systemctl waits for systemd.
         systemctl stop --no-block storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
         timeout 10 systemctl stop storage-disks-ensure-imported.service >/dev/null 2>&1 || true
         mkdir -p /run/storage-disks
@@ -195,82 +194,84 @@
         }
         trap finish EXIT
 
-        # zpool destroy says "pool is busy" while any dataset is still mounted.
-        # zfs list -o mountpoint only prints the property, so check "mounted".
-        release_pool() {
-          [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ] || return 0
-          while read -r ds; do
-            [ -n "$ds" ] || continue
-            mp=$(zfs get -H -o value mountpoint "$ds" 2>/dev/null || echo none)
-            case "$mp" in
-              ""|none|legacy|-)
-                timeout 15 zfs unmount -f "$ds" || true
-                continue
-                ;;
-              /)
-                echo "Refusing to unmount / for pool $pool." >&2
-                exit 1
-                ;;
+        # Linux cannot force-unmount a ZFS dataset another mount namespace
+        # still holds (containers inherit the host mounts). Lazy-unmount in
+        # each namespace, then destroy. If the kernel still says busy, only
+        # a reboot can drop it. The wipe then runs before ZFS imports.
+        unmount_everywhere() {
+          self_ns=$(readlink /proc/self/ns/mnt 2>/dev/null || true)
+          seen=" "
+          for mp in "$pool_mnt" "$ds_mnt"; do
+            timeout 5 umount -l "$mp" >/dev/null 2>&1 || true
+          done
+          for nsfile in /proc/[0-9]*/ns/mnt; do
+            ns=$(readlink "$nsfile" 2>/dev/null || true)
+            [ -n "$ns" ] || continue
+            [ "$ns" = "$self_ns" ] && continue
+            case "$seen" in
+              *" $ns "*) continue ;;
             esac
-            echo "Releasing $ds ($mp)."
-            zfs set canmount=off "$ds" || true
-            unit=$(systemd-escape --path --suffix=mount "$mp" 2>/dev/null || true)
-            if [ -n "$unit" ]; then
-              systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
-            fi
-            fuser -km "$mp" >/dev/null 2>&1 || true
-            self_ns=$(readlink /proc/self/ns/mnt 2>/dev/null || echo self)
-            for mi in /proc/[0-9]*/mountinfo; do
-              pid=''${mi#/proc/}
-              pid=''${pid%/mountinfo}
-              case "$pid" in
-                1|"$$") continue ;;
-              esac
-              pid_ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null || echo "$self_ns")
-              # Every host process lists this mount. Only other namespaces
-              # (containers) still hold the dataset after fuser -km.
-              [ "$pid_ns" = "$self_ns" ] && continue
-              if grep -q " zfs ''${ds} " "$mi" 2>/dev/null; then
-                echo "Stopping pid $pid, it still has $ds mounted." >&2
-                timeout 10 nsenter -t "$pid" -m umount -l "$mp" >/dev/null 2>&1 || true
-                kill -9 "$pid" 2>/dev/null || true
-              fi
+            seen="$seen $ns "
+            pid=''${nsfile#/proc/}
+            pid=''${pid%/ns/mnt}
+            for mp in "$pool_mnt" "$ds_mnt"; do
+              timeout 3 nsenter -t "$pid" -m umount -l "$mp" >/dev/null 2>&1 || true
             done
-            sleep 1
-            if ! timeout 15 zfs unmount -f "$ds"; then
-              echo "zfs unmount -f $ds failed." >&2
-            fi
-            timeout 10 umount -l "$mp" >/dev/null 2>&1 || true
-          done < <(zfs list -H -o name -r "$pool" 2>/dev/null | tac || true)
+          done
         }
 
-        pool_busy() {
-          zfs get -H -o name,value mounted -r "$pool" 2>/dev/null | awk '$2 == "yes" { found = 1 } END { exit !found }'
+        wipe_devices() {
+          root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+          root_real=$(readlink -f "$root_src" 2>/dev/null || echo "$root_src")
+          for d in "''${devices[@]}"; do
+            if [ ! -e "$d" ]; then
+              echo "Not attached, skipped: $d"
+              continue
+            fi
+            real=$(readlink -f "$d" || echo "$d")
+            if [ -n "$root_real" ] && [ "$real" = "$root_real" ]; then
+              echo "Refusing to wipe $d: it is the root disk." >&2
+              exit 1
+            fi
+            echo "Clearing labels on $d"
+            wipefs -af "$d" || true
+            while read -r part; do
+              [ -n "$part" ] || continue
+              [ "$part" = "$real" ] && continue
+              echo "Clearing labels on $part"
+              wipefs -af "$part" || true
+            done < <(lsblk -lnpo NAME "$real" 2>/dev/null || true)
+          done
         }
 
         if [ "$existing" = 1 ]; then
           if [ -z "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
             echo "Importing exported pool $pool so it can be destroyed..."
-            timeout 30 zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool"
+            timeout 20 zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool" || true
           fi
           echo "Unmounting $pool."
-          release_pool
-          if pool_busy; then
-            echo "Pool $pool is still mounted. Format stopped. Nothing was wiped." >&2
-            zfs get -H -o name,property,value mounted,mountpoint,canmount -r "$pool" >&2 || true
-            findmnt -t zfs >&2 || true
-            exit 1
-          fi
+          unmount_everywhere
           echo "Destroying pool $pool. Data on it will be gone."
-          if ! timeout 30 zpool destroy -f "$pool"; then
-            echo "Destroy did not finish. Exporting $pool." >&2
-            timeout 20 zpool export -f "$pool" >&2 || true
-            if [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
-              echo "Pool $pool is still imported. Format stopped. Nothing was wiped." >&2
+          if ! timeout 20 zpool destroy -f "$pool"; then
+            echo "Destroy failed. Exporting $pool." >&2
+            timeout 15 zpool export -f "$pool" >&2 || true
+          fi
+          if [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
+            flag=/var/lib/storage-disks/await-reboot
+            mkdir -p /var/lib/storage-disks
+            if [ -f "$flag" ]; then
+              echo "Pool $pool is still busy after a reboot. Format stopped. Nothing more was wiped." >&2
               exit 1
             fi
+            touch "$flag"
+            sync
+            echo "Pool $pool is still open in the kernel. Rebooting once. The disks are wiped before ZFS imports them." >&2
+            systemctl reboot --no-block || true
+            exit 0
           fi
         fi
+
+        wipe_devices
 
         for d in "''${devices[@]}"; do
           zpool labelclear -f "$d" 2>/dev/null || true
@@ -343,6 +344,7 @@
         echo "Set What Activate should do back to Import and Activate again."
         mkdir -p /var/lib/storage-disks
         printf '%s\n' ${escapeShellArg formatStamp} > /var/lib/storage-disks/format-stamp
+        rm -f /var/lib/storage-disks/await-reboot
       '';
 
       importScript = pkgs.writeShellScriptBin "storage-disks-import" ''
@@ -530,6 +532,36 @@
         exit 0
       '';
 
+      # Before ZFS import. A pool the kernel will not drop can only be
+      # erased here, while it is not imported yet.
+      wipeEarly = pkgs.writeShellScript "storage-disks-wipe-early" ''
+        set -u
+        expected=${escapeShellArg formatStamp}
+        stamp=/var/lib/storage-disks/format-stamp
+        devices=(${devicesShell})
+        if [ -f "$stamp" ] && [ "$(tr -d '\n' < "$stamp")" = "$expected" ]; then
+          exit 0
+        fi
+        root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+        root_real=$(readlink -f "$root_src" 2>/dev/null || echo "$root_src")
+        for d in "''${devices[@]}"; do
+          [ -e "$d" ] || continue
+          real=$(readlink -f "$d" || echo "$d")
+          if [ -n "$root_real" ] && [ "$real" = "$root_real" ]; then
+            echo "Refusing to wipe $d: it is the root disk." >&2
+            exit 0
+          fi
+          echo "Clearing labels on $d before ZFS import."
+          wipefs -af "$d" || true
+          while read -r part; do
+            [ -n "$part" ] || continue
+            [ "$part" = "$real" ] && continue
+            wipefs -af "$part" || true
+          done < <(lsblk -lnpo NAME "$real" 2>/dev/null || true)
+        done
+        exit 0
+      '';
+
       # Started from the Neo service page (and by Activate) when mode=format.
       # A matching stamp means this formatSerial already ran, so Activate is safe.
       formatApply = pkgs.writeShellScript "storage-disks-format-apply" ''
@@ -685,6 +717,29 @@
 
           # Oneshot, not RemainAfterExit. Until it has run it stays idle and
           # does not mark the service down. Activate starts it only when armed.
+          systemd.services.storage-disks-wipe-early = mkIf (cfg.mode == "format") {
+            description = "Wipe ${cfg.poolName} disks before ZFS import";
+            wantedBy = ["zfs-import.target"];
+            before = [
+              "zfs-import-cache.service"
+              "zfs-import-scan.service"
+              "zfs-import.target"
+            ];
+            after = ["systemd-udev-settle.service"];
+            path = [pkgs.util-linux pkgs.coreutils];
+            unitConfig = {
+              DefaultDependencies = false;
+              FailureAction = "none";
+              SuccessAction = "none";
+            };
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = false;
+              ExecStart = wipeEarly;
+              TimeoutStartSec = 60;
+            };
+          };
+
           systemd.services.storage-disks-format = {
             description = "Format pool ${cfg.poolName} (${cfg.layout}, ${cfg.encryption})";
             wantedBy = optional (cfg.mode == "format") "multi-user.target";
