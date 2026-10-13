@@ -182,19 +182,55 @@
         fi
 
         # The retry timer imports this pool. Stop it so it cannot revive the
-        # old pool between destroy and create.
+        # old pool between destroy and create. systemctl is on the unit PATH.
         systemctl stop storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
+        systemctl stop storage-disks-ensure-imported.service >/dev/null 2>&1 || true
         mkdir -p /run/storage-disks
         touch /run/storage-disks/formatting
         trap 'rm -f /run/storage-disks/formatting; systemctl start storage-disks-ensure-imported.timer >/dev/null 2>&1 || true' EXIT
 
+        # Mounted datasets, and any process still in them, make
+        # "zpool destroy -f" print "pool is busy" and then sleep until
+        # systemd kills the unit. Unmount first, and never wait more than
+        # half a minute.
+        release_pool() {
+          [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ] || return 0
+          while read -r ds mp; do
+            [ -n "$ds" ] || continue
+            case "$mp" in
+              ""|none|legacy|-)
+                timeout 15 zfs unmount -f "$ds" >/dev/null 2>&1 || true
+                ;;
+              /)
+                echo "Refusing to unmount / for pool $pool." >&2
+                exit 1
+                ;;
+              *)
+                fuser -km "$mp" >/dev/null 2>&1 || true
+                timeout 15 zfs unmount -f "$ds" >/dev/null 2>&1 || true
+                timeout 10 umount -f "$mp" >/dev/null 2>&1 || timeout 10 umount -l "$mp" >/dev/null 2>&1 || true
+                ;;
+            esac
+          done < <(zfs list -H -o name,mountpoint -r "$pool" 2>/dev/null | tac || true)
+        }
+
         if [ "$existing" = 1 ]; then
-          if ! zpool list "$pool" >/dev/null 2>&1; then
+          if [ -z "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
             echo "Importing exported pool $pool so it can be destroyed..."
-            zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool"
+            timeout 30 zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool"
           fi
+          echo "Unmounting $pool."
+          release_pool
           echo "Destroying pool $pool. Data on it will be gone."
-          zpool destroy -f "$pool"
+          if ! timeout 30 zpool destroy -f "$pool"; then
+            echo "Destroy did not finish. Exporting $pool and clearing labels." >&2
+            timeout 20 zpool export -f "$pool" >/dev/null 2>&1 || true
+            if [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
+              echo "Pool $pool is still imported. Format stopped. Nothing was wiped." >&2
+              zfs list -r "$pool" >&2 || true
+              exit 1
+            fi
+          fi
         fi
 
         for d in "''${devices[@]}"; do
@@ -617,6 +653,8 @@
             path = [
               formatScript
               pkgs.zfs
+              pkgs.systemd
+              pkgs.psmisc
               pkgs.coreutils
               pkgs.gawk
               pkgs.util-linux
@@ -630,7 +668,7 @@
               Type = "oneshot";
               RemainAfterExit = false;
               ExecStart = formatApply;
-              TimeoutStartSec = 300;
+              TimeoutStartSec = 120;
             };
           };
 
