@@ -608,24 +608,11 @@
             formatScript
           ];
 
-          # Status tab lists these units and can start them. The timer is armed
-          # instead of restarted on every Activate, so a missing disk stays quiet.
-          neo.services.storage-disks.systemdUnits = mkForce (
-            ["storage-disks-ensure-imported"]
-            ++ optional (cfg.mode == "format") "storage-disks-format"
-            ++ optional (cfg.replaceWith != "") "storage-disks-replace"
-          );
-          neo.services.storage-disks.systemdTimers = mkForce ["storage-disks-ensure-imported"];
-        }
-        (mkIf (cfg.mode == "format") {
-          systemd.services.storage-disks-format = lib.neo.mkSetupService {
-            inherit pkgs;
-            name = "storage-disks-format";
+          # Oneshot, not RemainAfterExit. Until it has run it stays idle and
+          # does not mark the service down. Activate starts it only when armed.
+          systemd.services.storage-disks-format = {
             description = "Format pool ${cfg.poolName} (${cfg.layout}, ${cfg.encryption})";
-            blocking = false;
-            retryInterval = 20;
-            maxAttempts = 6;
-            wantedBy = ["multi-user.target"];
+            wantedBy = optional (cfg.mode == "format") "multi-user.target";
             after = ["local-fs.target" "systemd-udev-trigger.service"];
             path = [
               formatScript
@@ -635,18 +622,21 @@
               pkgs.util-linux
               pkgs.gnugrep
             ];
-            script = formatApply;
+            unitConfig = {
+              FailureAction = "none";
+              SuccessAction = "none";
+            };
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = false;
+              ExecStart = formatApply;
+              TimeoutStartSec = 300;
+            };
           };
-        })
-        (mkIf (cfg.replaceWith != "") {
-          systemd.services.storage-disks-replace = lib.neo.mkSetupService {
-            inherit pkgs;
-            name = "storage-disks-replace";
+
+          systemd.services.storage-disks-replace = {
             description = "Replace a missing disk in ${cfg.poolName}";
-            blocking = false;
-            retryInterval = 20;
-            maxAttempts = 4;
-            wantedBy = ["multi-user.target"];
+            wantedBy = optional (cfg.replaceWith != "") "multi-user.target";
             after = ["local-fs.target" "storage-disks-ensure-imported.service"];
             path = [
               replaceScript
@@ -656,9 +646,18 @@
               pkgs.gawk
               pkgs.util-linux
             ];
-            script = replaceApply;
+            unitConfig = {
+              FailureAction = "none";
+              SuccessAction = "none";
+            };
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = false;
+              ExecStart = replaceApply;
+              TimeoutStartSec = 300;
+            };
           };
-        })
+        }
       ]);
     };
 }

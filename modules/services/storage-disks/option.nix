@@ -170,7 +170,11 @@
                 };
               };
             }
-            // lib.neo.mkSystemdUnits ["storage-disks-ensure-imported"]
+            // lib.neo.mkSystemdUnits [
+              "storage-disks-ensure-imported"
+              "storage-disks-format"
+              "storage-disks-replace"
+            ]
             // lib.neo.mkSystemdTimers ["storage-disks-ensure-imported"]
             // lib.neo.mkServiceMeta {
               category = "Storage";
