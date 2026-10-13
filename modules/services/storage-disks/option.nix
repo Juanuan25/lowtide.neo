@@ -20,15 +20,31 @@
                 type = types.enum ["import" "format"];
                 default = "import";
                 description = ''
-                  import: on boot, import poolName if its disks are attached.
-                  Never wipes disks. A missing pool does not fail boot.
-                  format: does not touch disks on activate. It only unlocks
-                  `storage-disks-format --yes`, which destroys an existing pool
-                  of this same name (if one is imported or exported), then
-                  creates the pool, the dataset, and the mountpoints.
-                  Set this back to import after.
+                  Import: attach the pool when the disks are there. Nothing is wiped.
+                  Format: the next Activate wipes poolName and creates it again
+                  with the layout and encryption set here, then mounts it.
+                  No shell command. After it shows done, set this back to Import
+                  and Activate again.
                 '';
                 rank = 10;
+                ui = lib.neo.ui.mkUi {
+                  label = "What Activate should do";
+                  choiceLabels = {
+                    import = "Import (keep the data)";
+                    format = "Format (wipe and create)";
+                  };
+                };
+              };
+              formatSerial = mkOption {
+                type = types.ints.unsigned;
+                default = 1;
+                description = ''
+                  Format runs once for this number. Activate again with the same
+                  number does not wipe a second time. Raise it by one, leave mode
+                  on Format, and Activate to wipe again.
+                '';
+                rank = 12;
+                ui = lib.neo.ui.mkUi {label = "Format number";};
               };
               encryption = mkOption {
                 type = types.enum ["keyfile" "none"];
@@ -46,6 +62,13 @@
                   is just mounted.
                 '';
                 rank = 15;
+                ui = lib.neo.ui.mkUi {
+                  label = "Encryption";
+                  choiceLabels = {
+                    keyfile = "Encrypted (key file)";
+                    none = "Not encrypted";
+                  };
+                };
               };
               poolName = mkOption {
                 type = types.str;
@@ -87,6 +110,16 @@
                   Import finds the pool by name, not by this list.
                 '';
                 rank = 60;
+                helper = lib.neo.mkHelper {
+                  id = "storage-disks-list";
+                  kind = "button";
+                  label = "Find disks";
+                  description = "Replace this list with whole disks that are plugged in, except the disk the system is running from.";
+                  apply = "set";
+                  script = ./list-disks.sh;
+                  inputs = [];
+                };
+                ui = lib.neo.ui.mkUi {label = "Disks";};
               };
               keyFile = mkOption {
                 type = types.str;
@@ -105,6 +138,24 @@
                 default = "mirror";
                 description = "vdev layout used only by storage-disks-format. mirror needs two or more devices.";
                 rank = 80;
+                ui = lib.neo.ui.mkUi {
+                  label = "Layout";
+                  choiceLabels = {
+                    mirror = "Mirror (copies on every disk)";
+                    stripe = "Stripe (one copy, uses all disks)";
+                  };
+                };
+              };
+              replaceWith = mkOption {
+                type = types.str;
+                default = "";
+                description = ''
+                  By-id path of a replacement disk. Leave empty to do nothing.
+                  Set it and Activate to swap it in for a missing mirror disk.
+                  That runs once. Clear the field afterwards.
+                '';
+                rank = 90;
+                ui = lib.neo.ui.mkUi {label = "Replace a dead disk with";};
               };
               autoScrub = {
                 enable = mkOption {
@@ -119,26 +170,29 @@
                 };
               };
             }
+            // lib.neo.mkSystemdUnits ["storage-disks-ensure-imported"]
+            // lib.neo.mkSystemdTimers ["storage-disks-ensure-imported"]
             // lib.neo.mkServiceMeta {
               category = "Storage";
               icon = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/truenas.svg";
               description = ''
-                ZFS pool on attached disks for Sanoid (destPrefix =
-                <poolName>/<dataset>). encryption=keyfile (default) is
-                AES-256-GCM with keyFile. encryption=none is plaintext.
+                Manage the backup disks from this page. No shell commands.
 
-                Boot imports the pool only when the disks are there, then
-                unlocks and mounts it. A missing disk or a missing key is
-                logged and skipped: it does not fail boot, and it does not
-                ask for a passphrase. The import is retried in the background.
+                Find disks fills the disk list (the system disk is skipped).
+                Pick encrypted or not, and mirror or stripe.
 
-                To put new disks into service: set devices to stable
-                /dev/disk/by-id/* paths, choose encryption and layout, set
-                mode=format, apply, then run `storage-disks-format --yes`.
-                That destroys an existing pool of this name, creates the new
-                pool and dataset, and mounts them. Set mode back to import and apply.
-                Replace a dead mirror disk with:
-                storage-disks-replace --yes /dev/disk/by-id/<new>.
+                Import keeps whatever is already on the disks and mounts it
+                when they are plugged in. A missing disk does not stop boot.
+                The Status tab can start that import, and it also retries itself.
+
+                Format wipes the pool named above and creates it again.
+                Set What Activate should do to Format, then press Activate.
+                Watch Status until the format unit says done, set it back to
+                Import, and Activate again. The same format number will not
+                wipe twice. Raise Format number to wipe again.
+
+                Sanoid should use <poolName>/<dataset> as destPrefix
+                (default datadisk/backups).
               '';
             };
         };

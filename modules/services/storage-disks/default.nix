@@ -23,6 +23,20 @@
       layout = escapeShellArg cfg.layout;
       encryption = escapeShellArg cfg.encryption;
       mode = escapeShellArg cfg.mode;
+      formatStamp = builtins.hashString "sha256" (concatStringsSep "\n" [
+        cfg.poolName
+        cfg.dataset
+        cfg.layout
+        cfg.encryption
+        (toString cfg.formatSerial)
+        cfg.poolMountPoint
+        cfg.mountPoint
+        (concatStringsSep "\n" cfg.devices)
+      ]);
+      replaceStamp = builtins.hashString "sha256" (concatStringsSep "\n" [
+        cfg.poolName
+        cfg.replaceWith
+      ]);
 
       # Shared by format/import/replace/ensure. $pool is the shell variable.
       loadKeyFn = ''
@@ -170,7 +184,9 @@
         # The retry timer imports this pool. Stop it so it cannot revive the
         # old pool between destroy and create.
         systemctl stop storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
-        trap 'systemctl start storage-disks-ensure-imported.timer >/dev/null 2>&1 || true' EXIT
+        mkdir -p /run/storage-disks
+        touch /run/storage-disks/formatting
+        trap 'rm -f /run/storage-disks/formatting; systemctl start storage-disks-ensure-imported.timer >/dev/null 2>&1 || true' EXIT
 
         if [ "$existing" = 1 ]; then
           if ! zpool list "$pool" >/dev/null 2>&1; then
@@ -249,7 +265,9 @@
         echo "  pool root: $pool_mnt"
         echo "  dataset:   $ds_mnt"
         echo "Sanoid destPrefix should be $pool/$dataset."
-        echo "Set neo.services.storage-disks.mode = \"import\" and apply so later boots import this pool."
+        echo "Set What Activate should do back to Import and Activate again."
+        mkdir -p /var/lib/storage-disks
+        printf '%s\n' ${escapeShellArg formatStamp} > /var/lib/storage-disks/format-stamp
       '';
 
       importScript = pkgs.writeShellScriptBin "storage-disks-import" ''
@@ -373,6 +391,10 @@
 
         log() { echo "storage-disks: $*"; }
 
+        if [ -e /run/storage-disks/formatting ]; then
+          exit 0
+        fi
+
         imported=0
         if zpool list "$pool" >/dev/null 2>&1; then
           imported=1
@@ -432,84 +454,211 @@
         fi
         exit 0
       '';
+
+      # Started from the Neo service page (and by Activate) when mode=format.
+      # A matching stamp means this formatSerial already ran, so Activate is safe.
+      formatApply = pkgs.writeShellScript "storage-disks-format-apply" ''
+        set -euo pipefail
+        pool=${pool}
+        layout=${layout}
+        encryption=${encryption}
+        expected=${escapeShellArg formatStamp}
+        stamp=/var/lib/storage-disks/format-stamp
+        devices=(${devicesShell})
+
+        if [ -f "$stamp" ] && [ "$(tr -d '\n' < "$stamp")" = "$expected" ]; then
+          echo "storage-disks: this format number was already applied."
+          exit 0
+        fi
+
+        ok=0
+        if zpool list "$pool" >/dev/null 2>&1; then
+          ok=1
+          enc=$(zfs get -H -o value encryption "$pool" 2>/dev/null || echo "off")
+          if [ "$encryption" = "none" ]; then
+            [ "$enc" = "off" ] || ok=0
+          else
+            if [ "$enc" = "off" ] || [ "$enc" = "-" ]; then
+              ok=0
+            fi
+          fi
+          if [ "$layout" = "mirror" ]; then
+            zpool status "$pool" | grep -q 'mirror-' || ok=0
+          elif zpool status "$pool" | grep -q 'mirror-'; then
+            ok=0
+          fi
+          for d in "''${devices[@]}"; do
+            zpool status -P "$pool" | grep -F -q "$d" || ok=0
+          done
+        fi
+        if [ "$ok" = 1 ]; then
+          mkdir -p /var/lib/storage-disks
+          printf '%s\n' "$expected" > "$stamp"
+          echo "storage-disks: pool already matches. Not wiping."
+          exit 0
+        fi
+
+        storage-disks-format --yes
+      '';
+
+      replaceApply = pkgs.writeShellScript "storage-disks-replace-apply" ''
+        set -euo pipefail
+        pool=${pool}
+        new=${escapeShellArg cfg.replaceWith}
+        expected=${escapeShellArg replaceStamp}
+        stamp=/var/lib/storage-disks/replace-stamp
+        if [ -z "$new" ]; then
+          echo "storage-disks: no replacement disk set."
+          exit 0
+        fi
+        if [ -f "$stamp" ] && [ "$(tr -d '\n' < "$stamp")" = "$expected" ]; then
+          echo "storage-disks: this replacement was already applied. Clear the field or change the path."
+          exit 0
+        fi
+        if ! zpool list "$pool" >/dev/null 2>&1; then
+          storage-disks-import
+        fi
+        if zpool status -P "$pool" | grep -F -q "$new"; then
+          mkdir -p /var/lib/storage-disks
+          printf '%s\n' "$expected" > "$stamp"
+          echo "storage-disks: $new is already in $pool."
+          exit 0
+        fi
+        storage-disks-replace --yes "$new"
+        mkdir -p /var/lib/storage-disks
+        printf '%s\n' "$expected" > "$stamp"
+      '';
     in {
-      config = mkIf cfg.enabled {
-        assertions = [
-          {
-            assertion = cfg.poolName != "" && cfg.dataset != "";
-            message = "neo.services.storage-disks: poolName and dataset must be set.";
-          }
-          {
-            assertion = hasPrefix "/" cfg.poolMountPoint && hasPrefix "/" cfg.mountPoint;
-            message = "neo.services.storage-disks: mount points must be absolute paths.";
-          }
-          {
-            assertion = cfg.encryption != "keyfile" || cfg.keyFile != "";
-            message = "neo.services.storage-disks: encryption=keyfile requires keyFile.";
-          }
-          {
-            assertion = cfg.mode != "format" || devices != [];
-            message = "neo.services.storage-disks: mode=format requires devices (stable /dev/disk/by-id/* paths).";
-          }
-          {
-            assertion = cfg.mode != "format" || cfg.layout != "mirror" || length devices >= 2;
-            message = "neo.services.storage-disks: layout=mirror needs at least two devices.";
-          }
-        ];
-
-        boot.supportedFilesystems = ["zfs"];
-
-        # Not wantedBy multi-user.target on purpose. A target waits for units it
-        # wants, and zpool import of a missing disk must not hold up boot.
-        # The timer starts the import shortly after boot, then retries.
-        # Sanoid Requires= this unit, so replication imports again just before it runs.
-        systemd.services.storage-disks-ensure-imported = {
-          description = "Import, unlock, and mount ZFS pool ${cfg.poolName} if its disks are attached";
-          after = [
-            "local-fs.target"
-            "zfs-import.target"
-            "systemd-udev-trigger.service"
+      config = mkIf cfg.enabled (mkMerge [
+        {
+          assertions = [
+            {
+              assertion = cfg.poolName != "" && cfg.dataset != "";
+              message = "neo.services.storage-disks: poolName and dataset must be set.";
+            }
+            {
+              assertion = hasPrefix "/" cfg.poolMountPoint && hasPrefix "/" cfg.mountPoint;
+              message = "neo.services.storage-disks: mount points must be absolute paths.";
+            }
+            {
+              assertion = cfg.encryption != "keyfile" || cfg.keyFile != "";
+              message = "neo.services.storage-disks: encryption=keyfile requires keyFile.";
+            }
+            {
+              assertion = cfg.mode != "format" || devices != [];
+              message = "neo.services.storage-disks: mode=format requires devices (stable /dev/disk/by-id/* paths).";
+            }
+            {
+              assertion = cfg.mode != "format" || cfg.layout != "mirror" || length devices >= 2;
+              message = "neo.services.storage-disks: layout=mirror needs at least two devices.";
+            }
           ];
-          wants = ["zfs-import.target"];
-          path = [
-            pkgs.zfs
-            pkgs.coreutils
-            pkgs.gawk
+
+          boot.supportedFilesystems = ["zfs"];
+
+          # Not wantedBy multi-user.target on purpose. A target waits for units it
+          # wants, and zpool import of a missing disk must not hold up boot.
+          # The timer starts the import shortly after boot, then retries.
+          # Sanoid Requires= this unit, so replication imports again just before it runs.
+          systemd.services.storage-disks-ensure-imported = {
+            description = "Import, unlock, and mount ZFS pool ${cfg.poolName} if its disks are attached";
+            after = [
+              "local-fs.target"
+              "zfs-import.target"
+              "systemd-udev-trigger.service"
+            ];
+            wants = ["zfs-import.target"];
+            path = [
+              pkgs.zfs
+              pkgs.coreutils
+              pkgs.gawk
+            ];
+            unitConfig = {
+              # Never escalate a missing backup disk into emergency mode.
+              FailureAction = "none";
+              SuccessAction = "none";
+            };
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = false;
+              ExecStart = ensureImported;
+              TimeoutStartSec = 25;
+              TimeoutStopSec = 5;
+            };
+          };
+
+          systemd.timers.storage-disks-ensure-imported = {
+            description = "Import ${cfg.poolName} after boot, and retry if the disks were late";
+            wantedBy = ["timers.target"];
+            timerConfig = {
+              OnBootSec = "10s";
+              OnUnitInactiveSec = "90s";
+              AccuracySec = "15s";
+            };
+          };
+
+          services.zfs.autoScrub = {
+            enable = cfg.autoScrub.enable;
+            interval = cfg.autoScrub.interval;
+          };
+
+          environment.systemPackages = [
+            importScript
+            replaceScript
+            formatScript
           ];
-          unitConfig = {
-            # Never escalate a missing backup disk into emergency mode.
-            FailureAction = "none";
-            SuccessAction = "none";
-          };
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = false;
-            ExecStart = ensureImported;
-            TimeoutStartSec = 25;
-            TimeoutStopSec = 5;
-          };
-        };
 
-        systemd.timers.storage-disks-ensure-imported = {
-          description = "Import ${cfg.poolName} after boot, and retry if the disks were late";
-          wantedBy = ["timers.target"];
-          timerConfig = {
-            OnBootSec = "10s";
-            OnUnitInactiveSec = "90s";
-            AccuracySec = "15s";
+          # Status tab lists these units and can start them. The timer is armed
+          # instead of restarted on every Activate, so a missing disk stays quiet.
+          neo.services.storage-disks.systemdUnits = mkForce (
+            ["storage-disks-ensure-imported"]
+            ++ optional (cfg.mode == "format") "storage-disks-format"
+            ++ optional (cfg.replaceWith != "") "storage-disks-replace"
+          );
+          neo.services.storage-disks.systemdTimers = mkForce ["storage-disks-ensure-imported"];
+        }
+        (mkIf (cfg.mode == "format") {
+          systemd.services.storage-disks-format = lib.neo.mkSetupService {
+            inherit pkgs;
+            name = "storage-disks-format";
+            description = "Format pool ${cfg.poolName} (${cfg.layout}, ${cfg.encryption})";
+            blocking = false;
+            retryInterval = 20;
+            maxAttempts = 6;
+            wantedBy = ["multi-user.target"];
+            after = ["local-fs.target" "systemd-udev-trigger.service"];
+            path = [
+              formatScript
+              pkgs.zfs
+              pkgs.coreutils
+              pkgs.gawk
+              pkgs.util-linux
+              pkgs.gnugrep
+            ];
+            script = formatApply;
           };
-        };
-
-        services.zfs.autoScrub = {
-          enable = cfg.autoScrub.enable;
-          interval = cfg.autoScrub.interval;
-        };
-
-        environment.systemPackages = [
-          importScript
-          replaceScript
-          formatScript
-        ];
-      };
+        })
+        (mkIf (cfg.replaceWith != "") {
+          systemd.services.storage-disks-replace = lib.neo.mkSetupService {
+            inherit pkgs;
+            name = "storage-disks-replace";
+            description = "Replace a missing disk in ${cfg.poolName}";
+            blocking = false;
+            retryInterval = 20;
+            maxAttempts = 4;
+            wantedBy = ["multi-user.target"];
+            after = ["local-fs.target" "storage-disks-ensure-imported.service"];
+            path = [
+              replaceScript
+              importScript
+              pkgs.zfs
+              pkgs.coreutils
+              pkgs.gawk
+              pkgs.util-linux
+            ];
+            script = replaceApply;
+          };
+        })
+      ]);
     };
 }
