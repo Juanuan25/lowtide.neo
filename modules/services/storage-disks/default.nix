@@ -194,10 +194,10 @@
         }
         trap finish EXIT
 
-        # Linux cannot force-unmount a ZFS dataset another mount namespace
-        # still holds (containers inherit the host mounts). Lazy-unmount in
-        # each namespace, then destroy. If the kernel still says busy, only
-        # a reboot can drop it. The wipe then runs before ZFS imports.
+        # Linux cannot force-unmount a dataset another mount namespace still
+        # holds. Try once. If the kernel keeps the pool, stop. The operator
+        # reboots. Nothing is wiped until that boot, and only if this
+        # Activate armed format-pending.
         unmount_everywhere() {
           self_ns=$(readlink /proc/self/ns/mnt 2>/dev/null || true)
           seen=" "
@@ -220,24 +220,27 @@
           done
         }
 
+        ${osDiskFn}
         wipe_devices() {
-          root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-          root_real=$(readlink -f "$root_src" 2>/dev/null || echo "$root_src")
           for d in "''${devices[@]}"; do
             if [ ! -e "$d" ]; then
               echo "Not attached, skipped: $d"
               continue
             fi
-            real=$(readlink -f "$d" || echo "$d")
-            if [ -n "$root_real" ] && [ "$real" = "$root_real" ]; then
-              echo "Refusing to wipe $d: it is the root disk." >&2
+            if os_disk "$d"; then
+              echo "Refusing to wipe $d: that disk holds the OS." >&2
               exit 1
             fi
+            real=$(readlink -f "$d" || echo "$d")
             echo "Clearing labels on $d"
             wipefs -af "$d" || true
             while read -r part; do
               [ -n "$part" ] || continue
               [ "$part" = "$real" ] && continue
+              if os_disk "$part"; then
+                echo "Refusing to wipe $part: that disk holds the OS." >&2
+                exit 1
+              fi
               echo "Clearing labels on $part"
               wipefs -af "$part" || true
             done < <(lsblk -lnpo NAME "$real" 2>/dev/null || true)
@@ -257,17 +260,14 @@
             timeout 15 zpool export -f "$pool" >&2 || true
           fi
           if [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
-            flag=/var/lib/storage-disks/await-reboot
             mkdir -p /var/lib/storage-disks
-            if [ -f "$flag" ]; then
-              echo "Pool $pool is still busy after a reboot. Format stopped. Nothing more was wiped." >&2
-              exit 1
-            fi
-            touch "$flag"
+            touch /var/lib/storage-disks/format-pending
             sync
-            echo "Pool $pool is still open in the kernel. Rebooting once. The disks are wiped before ZFS imports them." >&2
-            systemctl reboot --no-block || true
-            exit 0
+            echo "Pool $pool is still open in the kernel. Nothing was wiped." >&2
+            echo "Reboot when you want this format to finish. Leave mode on Format." >&2
+            echo "The next boot clears the disks before ZFS imports them, then creates the pool." >&2
+            echo "When the format unit shows done, set mode back to Import and Activate." >&2
+            exit 1
           fi
         fi
 
@@ -344,7 +344,7 @@
         echo "Set What Activate should do back to Import and Activate again."
         mkdir -p /var/lib/storage-disks
         printf '%s\n' ${escapeShellArg formatStamp} > /var/lib/storage-disks/format-stamp
-        rm -f /var/lib/storage-disks/await-reboot
+        rm -f /var/lib/storage-disks/format-pending /var/lib/storage-disks/await-reboot
       '';
 
       importScript = pkgs.writeShellScriptBin "storage-disks-import" ''
@@ -532,30 +532,81 @@
         exit 0
       '';
 
-      # Before ZFS import. A pool the kernel will not drop can only be
-      # erased here, while it is not imported yet.
+      # Whole disk behind /. ZFS root's findmnt source is a dataset name,
+      # so compare the pool's vdev disks, not that string.
+      osDiskFn = ''
+        os_disk() {
+          target=$(readlink -f "$1" 2>/dev/null || echo "$1")
+          [ -b "$target" ] || return 1
+          pk=$(lsblk -ndo PKNAME "$target" 2>/dev/null || true)
+          if [ -n "$pk" ]; then
+            target_disk=$(readlink -f "/dev/$pk")
+          else
+            target_disk=$target
+          fi
+          src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+          fstype=$(findmnt -n -o FSTYPE / 2>/dev/null || true)
+          if [ "$fstype" = "zfs" ]; then
+            rootpool=$(printf '%s' "$src" | cut -d/ -f1)
+            while read -r token; do
+              [ -e "$token" ] || continue
+              pk=$(lsblk -ndo PKNAME "$token" 2>/dev/null || true)
+              if [ -n "$pk" ]; then
+                token_disk=$(readlink -f "/dev/$pk")
+              else
+                token_disk=$(readlink -f "$token")
+              fi
+              if [ "$token_disk" = "$target_disk" ]; then
+                return 0
+              fi
+            done < <(zpool status -P "$rootpool" 2>/dev/null | awk '$1 ~ /^\// { print $1 }')
+            return 1
+          fi
+          if [ -e "$src" ]; then
+            pk=$(lsblk -ndo PKNAME "$src" 2>/dev/null || true)
+            if [ -n "$pk" ]; then
+              src_disk=$(readlink -f "/dev/$pk")
+            else
+              src_disk=$(readlink -f "$src" 2>/dev/null || echo "$src")
+            fi
+            if [ "$src_disk" = "$target_disk" ]; then
+              return 0
+            fi
+          fi
+          return 1
+        }
+      '';
+
+      # Before ZFS import, and only after Activate armed a pending format.
+      # An unrelated reboot does not wipe disks.
       wipeEarly = pkgs.writeShellScript "storage-disks-wipe-early" ''
         set -u
         expected=${escapeShellArg formatStamp}
         stamp=/var/lib/storage-disks/format-stamp
+        pending=/var/lib/storage-disks/format-pending
         devices=(${devicesShell})
+        [ -f "$pending" ] || exit 0
         if [ -f "$stamp" ] && [ "$(tr -d '\n' < "$stamp")" = "$expected" ]; then
+          rm -f "$pending"
           exit 0
         fi
-        root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-        root_real=$(readlink -f "$root_src" 2>/dev/null || echo "$root_src")
+        ${osDiskFn}
         for d in "''${devices[@]}"; do
           [ -e "$d" ] || continue
-          real=$(readlink -f "$d" || echo "$d")
-          if [ -n "$root_real" ] && [ "$real" = "$root_real" ]; then
-            echo "Refusing to wipe $d: it is the root disk." >&2
+          if os_disk "$d"; then
+            echo "Refusing to wipe $d: that disk holds the OS." >&2
             exit 0
           fi
+          real=$(readlink -f "$d" || echo "$d")
           echo "Clearing labels on $d before ZFS import."
           wipefs -af "$d" || true
           while read -r part; do
             [ -n "$part" ] || continue
             [ "$part" = "$real" ] && continue
+            if os_disk "$part"; then
+              echo "Refusing to wipe $part: that disk holds the OS." >&2
+              exit 0
+            fi
             wipefs -af "$part" || true
           done < <(lsblk -lnpo NAME "$real" 2>/dev/null || true)
         done
@@ -726,7 +777,7 @@
               "zfs-import.target"
             ];
             after = ["systemd-udev-settle.service"];
-            path = [pkgs.util-linux pkgs.coreutils];
+            path = [pkgs.util-linux pkgs.coreutils pkgs.gawk pkgs.zfs];
             unitConfig = {
               DefaultDependencies = false;
               FailureAction = "none";

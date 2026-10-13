@@ -23,8 +23,11 @@
                   Import: attach the pool when the disks are there. Nothing is wiped.
                   Format: the next Activate wipes poolName and creates it again
                   with the layout and encryption set here, then mounts it.
-                  No shell command. After it shows done, set this back to Import
-                  and Activate again.
+                  No shell command. If the kernel still has the pool open,
+                  Activate stops and wipes nothing. Reboot yourself and leave
+                  this on Format. The next boot clears the disks before ZFS
+                  imports them, then creates the pool. After it shows done,
+                  set this back to Import and Activate again.
                 '';
                 rank = 10;
                 ui = lib.neo.ui.mkUi {
@@ -191,9 +194,12 @@
 
                 Format wipes the pool named above and creates it again.
                 Set What Activate should do to Format, then press Activate.
-                Watch Status until the format unit says done, set it back to
-                Import, and Activate again. The same format number will not
-                wipe twice. Raise Format number to wipe again.
+                If the pool is still busy, nothing is wiped and the machine
+                stays up. Reboot yourself with mode left on Format. That boot
+                clears the disks before ZFS imports them. Watch Status until
+                the format unit says done, set it back to Import, and Activate
+                again. The same format number will not wipe twice. Raise
+                Format number to wipe again.
 
                 Sanoid should use <poolName>/<dataset> as destPrefix
                 (default datadisk/backups).
