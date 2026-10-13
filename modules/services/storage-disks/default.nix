@@ -1,4 +1,9 @@
-# Implementation: import an existing ZFS pool, or format listed disks into a new one.
+# Import an attached ZFS pool, or format listed disks into a new one.
+#
+# Boot contract: this pool is optional. It is not in boot.zfs.extraPools and
+# it is not a NixOS fileSystems entry, so a missing disk cannot fail
+# zfs-import.target or local-fs.target. The ensure script always exits 0.
+# Do not request a passphrase at boot — headless machines must come up.
 {...}: {
   flake.modules.nixos.storage-disks = {
     config,
@@ -10,17 +15,65 @@
       cfg = config.neo.services.storage-disks;
       devices = cfg.devices;
       devicesShell = escapeShellArgs devices;
-      pool = cfg.poolName;
-      dataset = cfg.dataset;
+      pool = escapeShellArg cfg.poolName;
+      dataset = escapeShellArg cfg.dataset;
+      keyFile = escapeShellArg cfg.keyFile;
+      poolMnt = escapeShellArg cfg.poolMountPoint;
+      dsMnt = escapeShellArg cfg.mountPoint;
+      layout = escapeShellArg cfg.layout;
+      encryption = escapeShellArg cfg.encryption;
+      mode = escapeShellArg cfg.mode;
+
+      # Shared by format/import/replace/ensure. $pool is the shell variable.
+      loadKeyFn = ''
+        load_key() {
+          keyfile="$1"
+          if [ -z "$keyfile" ] || [ ! -r "$keyfile" ]; then
+            echo "storage-disks: encryption key not readable (''${keyfile:-unset})." >&2
+            return 1
+          fi
+          size=$(wc -c < "$keyfile" | tr -d ' ')
+          if [ "$size" = "32" ]; then
+            zfs load-key -L "file://$keyfile" "$pool"
+            return $?
+          fi
+          tmp=$(mktemp)
+          if base64 -d "$keyfile" > "$tmp" 2>/dev/null && [ "$(wc -c < "$tmp" | tr -d ' ')" = "32" ]; then
+            zfs load-key -L "file://$tmp" "$pool"
+            rc=$?
+            rm -f "$tmp"
+            return $rc
+          fi
+          rm -f "$tmp"
+          echo "storage-disks: $keyfile is not a 32-byte raw key or base64 of one (got $size bytes)." >&2
+          return 1
+        }
+      '';
 
       formatScript = pkgs.writeShellScriptBin "storage-disks-format" ''
         set -euo pipefail
-        pool="${pool}"
-        dataset="${dataset}"
-        layout="${cfg.layout}"
-        pool_mnt="${cfg.poolMountPoint}"
-        ds_mnt="${cfg.mountPoint}"
+        pool=${pool}
+        dataset=${dataset}
+        layout=${layout}
+        encryption=${encryption}
+        mode=${mode}
+        pool_mnt=${poolMnt}
+        ds_mnt=${dsMnt}
+        keyfile=${keyFile}
         devices=(${devicesShell})
+
+        if [ "$(id -u)" -ne 0 ]; then
+          echo "storage-disks-format must run as root." >&2
+          exit 1
+        fi
+
+        if [ "$mode" != "format" ]; then
+          echo "storage-disks-format is locked (mode=$mode)." >&2
+          echo "This wipes the disks below and creates zpool '$pool'." >&2
+          echo "Set neo.services.storage-disks.mode = \"format\", apply, then re-run:" >&2
+          echo "  storage-disks-format --yes" >&2
+          exit 1
+        fi
 
         if [ ${toString (length devices)} -eq 0 ]; then
           echo "neo.services.storage-disks.devices is empty." >&2
@@ -32,38 +85,96 @@
             echo "Device $d not found. Use /dev/disk/by-id/* paths." >&2
             exit 1
           fi
+          real=$(readlink -f "$d" || echo "$d")
+          if lsblk -no MOUNTPOINT "$d" 2>/dev/null | grep -q '[^[:space:]]'; then
+            echo "Device $d (or a partition on it) is mounted. Unmount it first." >&2
+            exit 1
+          fi
+          if zpool status -P 2>/dev/null | grep -F -q "$d" || zpool status -P 2>/dev/null | grep -F -q "$real"; then
+            echo "Device $d belongs to a pool that is already imported. Refusing to format." >&2
+            zpool status >&2
+            exit 1
+          fi
         done
 
         if zpool list "$pool" >/dev/null 2>&1; then
-          echo "zpool $pool is already imported. Nothing to format." >&2
+          echo "zpool $pool is already imported. Export it first, or keep mode=import." >&2
           exit 1
         fi
 
-        existing=$(zpool import -d /dev/disk/by-id 2>/dev/null | awk '/^[[:space:]]*pool:/{print $2}' | head -n1 || true)
-        if [ -n "$existing" ]; then
-          echo "An exportable zpool named '$existing' is already on these disks." >&2
-          echo "Set mode=import and poolName=\"$existing\" instead of formatting." >&2
+        if zpool import -d /dev/disk/by-id 2>/dev/null | awk -v p="$pool" '$1 == "pool:" && $2 == p { found = 1 } END { exit !found }'; then
+          echo "zpool '$pool' is already on disk. Set mode=import instead of formatting." >&2
+          echo "Import does not wipe anything." >&2
+          exit 1
+        fi
+
+        if [ "$layout" = "mirror" ] && [ "''${#devices[@]}" -lt 2 ]; then
+          echo "layout=mirror needs at least two devices." >&2
           exit 1
         fi
 
         if [ "''${1:-}" != "--yes" ]; then
           echo "This DESTROYS all data on:" >&2
           printf '  %s\n' "''${devices[@]}" >&2
-          echo "and creates zpool '$pool' (layout=$layout)." >&2
+          echo "and creates zpool '$pool' (layout=$layout, encryption=$encryption)." >&2
+          echo "Dataset $pool/$dataset will be mounted at $ds_mnt." >&2
+          if [ "$encryption" = "keyfile" ]; then
+            echo "Key file: $keyfile (created if it does not exist yet)." >&2
+          else
+            echo "The pool will NOT be encrypted." >&2
+          fi
           echo "Re-run as: storage-disks-format --yes" >&2
+          exit 1
+        fi
+
+        create_args=(
+          -f
+          -o ashift=12
+          -o autotrim=on
+          -o cachefile=none
+          -O compression=zstd
+          -O atime=off
+          -O xattr=sa
+          -O mountpoint="$pool_mnt"
+        )
+
+        if [ "$encryption" = "keyfile" ]; then
+          if [ -z "$keyfile" ]; then
+            echo "encryption=keyfile requires neo.services.storage-disks.keyFile." >&2
+            exit 1
+          fi
+          install -d -m 0700 "$(dirname "$keyfile")"
+          if [ -e "$keyfile" ]; then
+            size=$(wc -c < "$keyfile" | tr -d ' ')
+            if [ "$size" != "32" ]; then
+              echo "Refusing to overwrite $keyfile ($size bytes, want 32)." >&2
+              echo "Move it aside or point keyFile at a new path." >&2
+              exit 1
+            fi
+            echo "Using existing key $keyfile"
+          else
+            umask 077
+            dd if=/dev/urandom of="$keyfile" bs=32 count=1 status=none
+            chmod 600 "$keyfile"
+            echo "Generated a new 32-byte key at $keyfile"
+            echo "Back this file up. Without it the pool cannot be unlocked."
+          fi
+          create_args+=(
+            -O encryption=aes-256-gcm
+            -O keyformat=raw
+            -O keylocation="file://$keyfile"
+          )
+        elif [ "$encryption" != "none" ]; then
+          echo "Unknown encryption $encryption (want keyfile or none)." >&2
           exit 1
         fi
 
         case "$layout" in
           mirror)
-            if [ "''${#devices[@]}" -lt 2 ]; then
-              echo "layout=mirror needs at least two devices." >&2
-              exit 1
-            fi
-            zpool create -o ashift=12 -O mountpoint="$pool_mnt" "$pool" mirror "''${devices[@]}"
+            zpool create "''${create_args[@]}" "$pool" mirror "''${devices[@]}"
             ;;
           stripe)
-            zpool create -o ashift=12 -O mountpoint="$pool_mnt" "$pool" "''${devices[@]}"
+            zpool create "''${create_args[@]}" "$pool" "''${devices[@]}"
             ;;
           *)
             echo "Unknown layout $layout" >&2
@@ -71,49 +182,41 @@
             ;;
         esac
 
+        zpool set cachefile=none "$pool" || true
         zfs create -o mountpoint="$ds_mnt" "$pool/$dataset"
-        echo "Created $pool/$dataset at $ds_mnt."
-      '';
+        zfs mount "$pool" || true
+        zfs mount "$pool/$dataset"
 
-      loadKey = ''
-        keyfile="${cfg.keyFile}"
-        status=$(zfs get -H -o value keystatus "$pool" 2>/dev/null || true)
-        if [ "$status" = "available" ]; then
-          :
-        elif [ -z "$keyfile" ] || [ ! -r "$keyfile" ]; then
-          echo "ZFS key for $pool not loaded (missing $keyfile)." >&2
-          exit 1
-        else
-          size=$(wc -c < "$keyfile" | tr -d ' ')
-          if [ "$size" = "32" ]; then
-            zfs load-key -L "file://$keyfile" "$pool"
-          else
-            tmp=$(mktemp)
-            if base64 -d "$keyfile" > "$tmp" 2>/dev/null && [ "$(wc -c < "$tmp" | tr -d ' ')" = "32" ]; then
-              zfs load-key -L "file://$tmp" "$pool"
-            else
-              rm -f "$tmp"
-              echo "ZFS key $keyfile is not a 32-byte raw key (got $size bytes)." >&2
-              exit 1
-            fi
-            rm -f "$tmp"
-          fi
-        fi
+        echo "Created $pool/$dataset ($encryption)."
+        echo "  pool root: $pool_mnt"
+        echo "  dataset:   $ds_mnt"
+        echo "Sanoid destPrefix should be $pool/$dataset."
+        echo "Set neo.services.storage-disks.mode = \"import\" and apply so later boots import this pool."
       '';
 
       importScript = pkgs.writeShellScriptBin "storage-disks-import" ''
         set -euo pipefail
-        pool="${pool}"
-        dataset="${dataset}"
+        pool=${pool}
+        dataset=${dataset}
+        keyfile=${keyFile}
+
+        ${loadKeyFn}
 
         if zpool list "$pool" >/dev/null 2>&1; then
           echo "zpool $pool already imported."
         else
-          echo "Importing zpool $pool (force, by-id)..."
-          zpool import -f -d /dev/disk/by-id "$pool"
+          echo "Importing zpool $pool (force, by-id, no cachefile)..."
+          zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool"
         fi
+        zpool set cachefile=none "$pool" || true
 
-        ${loadKey}
+        enc=$(zfs get -H -o value encryption "$pool" 2>/dev/null || echo "off")
+        if [ "$enc" != "off" ] && [ "$enc" != "-" ]; then
+          status=$(zfs get -H -o value keystatus "$pool" 2>/dev/null || echo "unavailable")
+          if [ "$status" != "available" ]; then
+            load_key "$keyfile"
+          fi
+        fi
 
         if ! zfs list "$pool/$dataset" >/dev/null 2>&1; then
           echo "Dataset $pool/$dataset does not exist." >&2
@@ -121,13 +224,15 @@
           exit 1
         fi
 
-        zfs mount -a || true
-        echo "Imported $pool. Native mounts: ${cfg.poolMountPoint} and ${cfg.mountPoint}."
+        zfs mount "$pool" || true
+        zfs mount "$pool/$dataset"
+        echo "Imported $pool ($enc). Mounts: ${cfg.poolMountPoint} and ${cfg.mountPoint}."
       '';
 
       replaceScript = pkgs.writeShellScriptBin "storage-disks-replace" ''
         set -euo pipefail
-        pool="${pool}"
+        pool=${pool}
+        keyfile=${keyFile}
         yes=0
         args=()
         for a in "$@"; do
@@ -138,9 +243,19 @@
           fi
         done
 
+        ${loadKeyFn}
+
         if ! zpool list "$pool" >/dev/null 2>&1; then
           echo "zpool $pool is not imported. Run storage-disks-import first." >&2
           exit 1
+        fi
+
+        enc=$(zfs get -H -o value encryption "$pool" 2>/dev/null || echo "off")
+        if [ "$enc" != "off" ] && [ "$enc" != "-" ]; then
+          status=$(zfs get -H -o value keystatus "$pool" 2>/dev/null || echo "unavailable")
+          if [ "$status" != "available" ]; then
+            load_key "$keyfile"
+          fi
         fi
 
         old=""
@@ -178,7 +293,7 @@
         fi
 
         if [ "$yes" != 1 ]; then
-          echo "This will replace $old with $new in mirror $pool." >&2
+          echo "This will replace $old with $new in pool $pool." >&2
           echo "The new disk will be resilvered. Re-run with --yes." >&2
           exit 1
         fi
@@ -188,20 +303,92 @@
         echo "Resilver started. Watch with: watch -n 5 zpool status $pool"
       '';
 
+      # Always exits 0. A missing disk or a missing key must not fail the boot job.
       ensureImported = pkgs.writeShellScript "storage-disks-ensure-imported" ''
-        set -euo pipefail
-        pool="${pool}"
-        if ! zpool list "$pool" >/dev/null 2>&1; then
-          zpool import -f -d /dev/disk/by-id "$pool"
+        set -uo pipefail
+        pool=${pool}
+        dataset=${dataset}
+        keyfile=${keyFile}
+        stamp="/run/storage-disks/$pool.missing"
+
+        ${loadKeyFn}
+
+        log() { echo "storage-disks: $*"; }
+
+        imported=0
+        if zpool list "$pool" >/dev/null 2>&1; then
+          imported=1
+        else
+          for _ in 1 2 3; do
+            if zpool import -f -N -o cachefile=none -d /dev/disk/by-id "$pool"; then
+              imported=1
+              break
+            fi
+            sleep 2
+          done
         fi
-        ${loadKey}
+
+        if [ "$imported" != 1 ]; then
+          if [ ! -e "$stamp" ]; then
+            mkdir -p /run/storage-disks
+            log "$pool is not available. Not mounting it. Boot continues, and import will be retried."
+            touch "$stamp"
+          fi
+          exit 0
+        fi
+
+        # Keep this pool out of /etc/zfs/zpool.cache. On NixOS that file is often
+        # not writable, and a cached pool is imported early — a missing disk then
+        # stalls boot. cachefile=none is not sticky, so set it whenever it drifted.
+        cf=$(zpool get -H -o value cachefile "$pool" 2>/dev/null || true)
+        if [ -n "$cf" ] && [ "$cf" != "none" ]; then
+          zpool set cachefile=none "$pool" >/dev/null 2>&1 || true
+        fi
+
+        enc=$(zfs get -H -o value encryption "$pool" 2>/dev/null || echo "off")
+        if [ "$enc" != "off" ] && [ "$enc" != "-" ]; then
+          status=$(zfs get -H -o value keystatus "$pool" 2>/dev/null || echo "unavailable")
+          if [ "$status" != "available" ]; then
+            if ! load_key "$keyfile"; then
+              if [ ! -e "$stamp" ]; then
+                mkdir -p /run/storage-disks
+                log "$pool is imported but still locked (key $keyfile). Not mounting it. Boot continues."
+                touch "$stamp"
+              fi
+              exit 0
+            fi
+            log "unlocked $pool"
+          fi
+        fi
+
         zfs mount "$pool" >/dev/null 2>&1 || true
-        zfs mount "$pool/${dataset}" >/dev/null 2>&1 || true
-        zfs mount -a >/dev/null 2>&1 || true
+        if zfs list "$pool/$dataset" >/dev/null 2>&1; then
+          zfs mount "$pool/$dataset" >/dev/null 2>&1 || true
+        else
+          log "dataset $pool/$dataset does not exist yet. Pool was left imported."
+        fi
+
+        if [ -e "$stamp" ]; then
+          log "$pool is imported now."
+          rm -f "$stamp"
+        fi
+        exit 0
       '';
     in {
       config = mkIf cfg.enabled {
         assertions = [
+          {
+            assertion = cfg.poolName != "" && cfg.dataset != "";
+            message = "neo.services.storage-disks: poolName and dataset must be set.";
+          }
+          {
+            assertion = hasPrefix "/" cfg.poolMountPoint && hasPrefix "/" cfg.mountPoint;
+            message = "neo.services.storage-disks: mount points must be absolute paths.";
+          }
+          {
+            assertion = cfg.encryption != "keyfile" || cfg.keyFile != "";
+            message = "neo.services.storage-disks: encryption=keyfile requires keyFile.";
+          }
           {
             assertion = cfg.mode != "format" || devices != [];
             message = "neo.services.storage-disks: mode=format requires devices (stable /dev/disk/by-id/* paths).";
@@ -213,38 +400,45 @@
         ];
 
         boot.supportedFilesystems = ["zfs"];
-        boot.zfs.extraPools = [pool];
-        boot.zfs.forceImportAll = mkDefault true;
-        boot.zfs.devNodes = "/dev/disk/by-id";
-        boot.zfs.requestEncryptionCredentials = [pool];
 
-        # Do not let a late USB disk stall or fail the boot target.
-        systemd.services."zfs-import-${pool}" = {
-          after = ["systemd-udev-settle.service"];
-          serviceConfig.TimeoutStartSec = "90s";
-        };
-
-        # After /root is mounted: import, load-key, native-mount. Retries if USB is late.
+        # Not wantedBy multi-user.target on purpose. A target waits for units it
+        # wants, and zpool import of a missing disk must not hold up boot.
+        # The timer starts the import shortly after boot, then retries.
+        # Sanoid Requires= this unit, so replication imports again just before it runs.
         systemd.services.storage-disks-ensure-imported = {
-          description = "Ensure ZFS pool ${pool} is imported, unlocked, and mounted";
+          description = "Import, unlock, and mount ZFS pool ${cfg.poolName} if its disks are attached";
           after = [
             "local-fs.target"
-            "systemd-udev-settle.service"
             "zfs-import.target"
+            "systemd-udev-trigger.service"
           ];
-          wants = ["systemd-udev-settle.service"];
-          wantedBy = ["multi-user.target"];
+          wants = ["zfs-import.target"];
+          path = [
+            pkgs.zfs
+            pkgs.coreutils
+            pkgs.gawk
+          ];
+          unitConfig = {
+            # Never escalate a missing backup disk into emergency mode.
+            FailureAction = "none";
+            SuccessAction = "none";
+          };
           serviceConfig = {
             Type = "oneshot";
-            RemainAfterExit = true;
+            RemainAfterExit = false;
             ExecStart = ensureImported;
-            Restart = "on-failure";
-            RestartSec = 15;
-            TimeoutStartSec = 60;
+            TimeoutStartSec = 25;
+            TimeoutStopSec = 5;
           };
-          unitConfig = {
-            StartLimitIntervalSec = 300;
-            StartLimitBurst = 12;
+        };
+
+        systemd.timers.storage-disks-ensure-imported = {
+          description = "Import ${cfg.poolName} after boot, and retry if the disks were late";
+          wantedBy = ["timers.target"];
+          timerConfig = {
+            OnBootSec = "10s";
+            OnUnitInactiveSec = "90s";
+            AccuracySec = "15s";
           };
         };
 
@@ -253,10 +447,11 @@
           interval = cfg.autoScrub.interval;
         };
 
-        environment.systemPackages =
-          [importScript replaceScript]
-          ++ optional (cfg.mode == "format") formatScript;
+        environment.systemPackages = [
+          importScript
+          replaceScript
+          formatScript
+        ];
       };
     };
 }
-
