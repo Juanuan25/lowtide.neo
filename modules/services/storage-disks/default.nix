@@ -182,36 +182,70 @@
         fi
 
         # The retry timer imports this pool. Stop it so it cannot revive the
-        # old pool between destroy and create. systemctl is on the unit PATH.
-        systemctl stop storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
-        systemctl stop storage-disks-ensure-imported.service >/dev/null 2>&1 || true
+        # old pool between destroy and create. systemctl start without
+        # --no-block deadlocks here: systemd is waiting for this start job,
+        # and systemctl waits for systemd. That is the two minute timeout.
+        systemctl stop --no-block storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
+        timeout 10 systemctl stop storage-disks-ensure-imported.service >/dev/null 2>&1 || true
         mkdir -p /run/storage-disks
         touch /run/storage-disks/formatting
-        trap 'rm -f /run/storage-disks/formatting; systemctl start storage-disks-ensure-imported.timer >/dev/null 2>&1 || true' EXIT
+        finish() {
+          rm -f /run/storage-disks/formatting
+          timeout 5 systemctl start --no-block storage-disks-ensure-imported.timer >/dev/null 2>&1 || true
+        }
+        trap finish EXIT
 
-        # Mounted datasets, and any process still in them, make
-        # "zpool destroy -f" print "pool is busy" and then sleep until
-        # systemd kills the unit. Unmount first, and never wait more than
-        # half a minute.
+        # zpool destroy says "pool is busy" while any dataset is still mounted.
+        # zfs list -o mountpoint only prints the property, so check "mounted".
         release_pool() {
           [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ] || return 0
-          while read -r ds mp; do
+          while read -r ds; do
             [ -n "$ds" ] || continue
+            mp=$(zfs get -H -o value mountpoint "$ds" 2>/dev/null || echo none)
             case "$mp" in
               ""|none|legacy|-)
-                timeout 15 zfs unmount -f "$ds" >/dev/null 2>&1 || true
+                timeout 15 zfs unmount -f "$ds" || true
+                continue
                 ;;
               /)
                 echo "Refusing to unmount / for pool $pool." >&2
                 exit 1
                 ;;
-              *)
-                fuser -km "$mp" >/dev/null 2>&1 || true
-                timeout 15 zfs unmount -f "$ds" >/dev/null 2>&1 || true
-                timeout 10 umount -f "$mp" >/dev/null 2>&1 || timeout 10 umount -l "$mp" >/dev/null 2>&1 || true
-                ;;
             esac
-          done < <(zfs list -H -o name,mountpoint -r "$pool" 2>/dev/null | tac || true)
+            echo "Releasing $ds ($mp)."
+            zfs set canmount=off "$ds" || true
+            unit=$(systemd-escape --path --suffix=mount "$mp" 2>/dev/null || true)
+            if [ -n "$unit" ]; then
+              systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
+            fi
+            fuser -km "$mp" >/dev/null 2>&1 || true
+            self_ns=$(readlink /proc/self/ns/mnt 2>/dev/null || echo self)
+            for mi in /proc/[0-9]*/mountinfo; do
+              pid=''${mi#/proc/}
+              pid=''${pid%/mountinfo}
+              case "$pid" in
+                1|"$$") continue ;;
+              esac
+              pid_ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null || echo "$self_ns")
+              # Every host process lists this mount. Only other namespaces
+              # (containers) still hold the dataset after fuser -km.
+              [ "$pid_ns" = "$self_ns" ] && continue
+              if grep -q " zfs ''${ds} " "$mi" 2>/dev/null; then
+                echo "Stopping pid $pid, it still has $ds mounted." >&2
+                timeout 10 nsenter -t "$pid" -m umount -l "$mp" >/dev/null 2>&1 || true
+                kill -9 "$pid" 2>/dev/null || true
+              fi
+            done
+            sleep 1
+            if ! timeout 15 zfs unmount -f "$ds"; then
+              echo "zfs unmount -f $ds failed." >&2
+            fi
+            timeout 10 umount -l "$mp" >/dev/null 2>&1 || true
+          done < <(zfs list -H -o name -r "$pool" 2>/dev/null | tac || true)
+        }
+
+        pool_busy() {
+          zfs get -H -o name,value mounted -r "$pool" 2>/dev/null | awk '$2 == "yes" { found = 1 } END { exit !found }'
         }
 
         if [ "$existing" = 1 ]; then
@@ -221,13 +255,18 @@
           fi
           echo "Unmounting $pool."
           release_pool
+          if pool_busy; then
+            echo "Pool $pool is still mounted. Format stopped. Nothing was wiped." >&2
+            zfs get -H -o name,property,value mounted,mountpoint,canmount -r "$pool" >&2 || true
+            findmnt -t zfs >&2 || true
+            exit 1
+          fi
           echo "Destroying pool $pool. Data on it will be gone."
           if ! timeout 30 zpool destroy -f "$pool"; then
-            echo "Destroy did not finish. Exporting $pool and clearing labels." >&2
-            timeout 20 zpool export -f "$pool" >/dev/null 2>&1 || true
+            echo "Destroy did not finish. Exporting $pool." >&2
+            timeout 20 zpool export -f "$pool" >&2 || true
             if [ -n "$(zpool list -H -o name "$pool" 2>/dev/null || true)" ]; then
               echo "Pool $pool is still imported. Format stopped. Nothing was wiped." >&2
-              zfs list -r "$pool" >&2 || true
               exit 1
             fi
           fi
@@ -668,7 +707,7 @@
               Type = "oneshot";
               RemainAfterExit = false;
               ExecStart = formatApply;
-              TimeoutStartSec = 120;
+              TimeoutStartSec = 90;
             };
           };
 
