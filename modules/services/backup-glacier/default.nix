@@ -17,6 +17,18 @@
         concatStringsSep "\n" cfg.datasets + "\n"
       );
       script = pkgs.writeShellScript "backup-glacier-run" (builtins.readFile ./run.sh);
+      # s3://bucket/prefix/path/ -> bucket name and key prefix. Assertions reject
+      # anything that is not that shape before these are used.
+      s3Segments = filter (s: s != "") (splitString "/" (removePrefix "s3://" cfg.s3Uri));
+      bucket =
+        if s3Segments == []
+        then ""
+        else head s3Segments;
+      prefix = concatStringsSep "/" (
+        if s3Segments == []
+        then []
+        else tail s3Segments
+      );
     in {
       config = mkIf cfg.enabled {
         assertions = [
@@ -25,16 +37,15 @@
             message = "neo.services.backup-glacier: datasets must list at least one ZFS dataset.";
           }
           {
-            assertion = builtins.match "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]" cfg.bucket != null;
-            message = "neo.services.backup-glacier: bucket must be an existing S3 bucket name.";
+            assertion =
+              builtins.match "s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/[A-Za-z0-9._-]+)+/?" cfg.s3Uri
+              != null
+              && all (s: s != "." && s != "..") s3Segments;
+            message = "neo.services.backup-glacier: s3Uri must look like s3://bucket/prefix/ (a bucket name, then at least one path segment).";
           }
           {
             assertion = builtins.match "[a-z][a-z0-9-]+" cfg.region != null;
-            message = "neo.services.backup-glacier: region must be set (for example eu-central-1).";
-          }
-          {
-            assertion = builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" cfg.prefix != null;
-            message = "neo.services.backup-glacier: prefix must be letters, digits, dots, underscores, or hyphens.";
+            message = "neo.services.backup-glacier: region must be an AWS region (default eu-central-2).";
           }
           {
             assertion =
@@ -77,9 +88,9 @@
           environment = {
             BACKUP_GLACIER_STATE = cfg.appdata;
             BACKUP_GLACIER_DATASETS_FILE = datasetsFile;
-            BACKUP_GLACIER_BUCKET = cfg.bucket;
+            BACKUP_GLACIER_BUCKET = bucket;
             BACKUP_GLACIER_REGION = cfg.region;
-            BACKUP_GLACIER_PREFIX = cfg.prefix;
+            BACKUP_GLACIER_PREFIX = prefix;
             BACKUP_GLACIER_STORAGE_CLASS = cfg.storageClass;
             BACKUP_GLACIER_PLANNER = "${./plan.py}";
             BACKUP_GLACIER_RETENTION_DAYS = toString cfg.retentionDays;

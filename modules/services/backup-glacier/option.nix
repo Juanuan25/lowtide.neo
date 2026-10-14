@@ -15,11 +15,6 @@
         if (sanoid.datasets or []) != []
         then map (ds: "${sanoid.destPrefix or "datadisk/backups"}/${leaf ds}") sanoid.datasets
         else ["datadisk/backups/zroot"];
-      hostname = config.neo.core.hostname or "neo";
-      defaultPrefix =
-        if builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" hostname != null
-        then hostname
-        else "neo";
     in {
       options.neo.services.backup-glacier = mkOption {
         type = types.submodule {
@@ -56,47 +51,45 @@
                 ui = lib.neo.ui.mkUi {label = "Include child datasets";};
               };
 
-              bucket = mkOption {
+              s3Uri = mkOption {
                 type = types.str;
                 default = "";
-                example = "lowtide-backups";
+                example = "s3://amzn-s4-mybucket-bucket/homeserver-backups/";
                 description = ''
-                  Existing S3 bucket. The service does not create it.
+                  Where the streams go. The host is the bucket. The path is
+                  the folder inside it, for example
+                  s3://amzn-s4-mybucket-bucket/homeserver-backups/.
+                  A trailing slash is optional. This is the address, not a
+                  login; the AWS key file below is how the machine authenticates.
+                  The service does not create the bucket.
                   Block all public access. Leave versioning off (old versions
                   are not restorable sends, and you pay for them forever).
                   Do not add a lifecycle rule that transitions or expires these
                   objects; this service deletes only what it uploaded, and only
-                  after retentionDays.
+                  after retentionDays. Changing the path does not move objects
+                  that are already uploaded.
                 '';
                 rank = 30;
                 ui = lib.neo.ui.mkUi {
-                  label = "Bucket";
+                  label = "S3 URI";
                   summary = true;
                 };
               };
 
               region = mkOption {
                 type = types.str;
-                default = "";
-                example = "eu-central-1";
-                description = "AWS region of that bucket. No default: the wrong region writes to the wrong place.";
+                default = "eu-central-2";
+                example = "eu-central-2";
+                description = ''
+                  AWS region of that bucket. Default is eu-central-2.
+                  The S3 URI does not include it. A mismatch writes to the
+                  wrong place or the upload is rejected.
+                '';
                 rank = 40;
                 ui = lib.neo.ui.mkUi {
                   label = "Region";
                   summary = true;
                 };
-              };
-
-              prefix = mkOption {
-                type = types.str;
-                default = defaultPrefix;
-                description = ''
-                  Key prefix inside the bucket. Defaults to the hostname so two
-                  machines do not share a key space. Changing it does not move
-                  objects that are already uploaded.
-                '';
-                rank = 50;
-                ui = lib.neo.ui.mkUi {label = "Prefix";};
               };
 
               storageClass = mkOption {
@@ -129,17 +122,24 @@
                 default = "";
                 example = "/root/keys/backup-glacier-aws.env";
                 description = ''
-                  Absolute path of a root-only file (mode 0600) with
-                  AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, one KEY=value
-                  per line, no quotes and no export. Not a Nix store path:
-                  the store is world-readable. The IAM user needs
-                  s3:ListBucket and s3:GetBucketLocation on the bucket, and
-                  s3:GetObject, s3:PutObject, s3:DeleteObject,
+                  Path to the AWS login, not the keys themselves.
+                  Create an IAM user that can only touch this bucket, then an
+                  access key for it. Put these two lines in a file on the OS disk:
+
+                    AWS_ACCESS_KEY_ID=AKIA...
+                    AWS_SECRET_ACCESS_KEY=...
+
+                  No quotes and no export. Owner root, mode 0600.
+                  This page stores the path. Do not paste the keys here:
+                  settings end up in the Nix store, which every user on the
+                  machine can read. systemd loads the file when the backup starts.
+                  The IAM user needs s3:ListBucket and s3:GetBucketLocation on
+                  the bucket, and s3:GetObject, s3:PutObject, s3:DeleteObject,
                   s3:AbortMultipartUpload, and s3:ListMultipartUploadParts
                   on the prefix. It does not need s3:CreateBucket.
                 '';
                 rank = 70;
-                ui = lib.neo.ui.mkUi {label = "AWS credentials file";};
+                ui = lib.neo.ui.mkUi {label = "AWS key file";};
               };
 
               schedule = mkOption {
@@ -242,6 +242,8 @@
 
                 This is not the old rclone sync. sourcePath, bucketPath, and
                 extraRcloneFlags are gone; a file sync rewrites Glacier objects.
+                The destination is one S3 URI (s3://bucket/prefix/), not a
+                separate bucket and prefix.
               '';
               projectUrl = "https://rclone.org";
               githubUrl = "https://github.com/rclone/rclone";
