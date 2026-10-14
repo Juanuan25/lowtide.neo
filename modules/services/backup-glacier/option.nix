@@ -60,7 +60,7 @@
                   the folder inside it, for example
                   s3://amzn-s4-mybucket-bucket/homeserver-backups/.
                   A trailing slash is optional. This is the address, not a
-                  login; the AWS key file below is how the machine authenticates.
+                  login. Paste the IAM access key in the two fields below.
                   The service does not create the bucket.
                   Block all public access. Leave versioning off (old versions
                   are not restorable sends, and you pay for them forever).
@@ -117,29 +117,34 @@
                 };
               };
 
-              environmentFile = mkOption {
+              accessKeyId = mkOption {
                 type = types.str;
                 default = "";
-                example = "/root/keys/backup-glacier-aws.env";
+                example = "AKIAIOSFODNN7EXAMPLE";
                 description = ''
-                  Path to the AWS login, not the keys themselves.
-                  Create an IAM user that can only touch this bucket, then an
-                  access key for it. Put these two lines in a file on the OS disk:
+                  Access key ID of an IAM user that can only touch this bucket.
+                  Create the key in AWS and paste it here. There is no file to
+                  copy onto the machine.
+                '';
+                rank = 70;
+                ui = lib.neo.ui.mkUi {label = "Access key ID";};
+              };
 
-                    AWS_ACCESS_KEY_ID=AKIA...
-                    AWS_SECRET_ACCESS_KEY=...
-
-                  No quotes and no export. Owner root, mode 0600.
-                  This page stores the path. Do not paste the keys here:
-                  settings end up in the Nix store, which every user on the
-                  machine can read. systemd loads the file when the backup starts.
+              secretAccessKey = mkOption {
+                type = types.str;
+                default = "";
+                example = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+                description = ''
+                  Secret access key for that ID. AWS shows it once, when the
+                  key is created. Paste it here and Activate. Neo stores it
+                  with the rest of this service's settings.
                   The IAM user needs s3:ListBucket and s3:GetBucketLocation on
                   the bucket, and s3:GetObject, s3:PutObject, s3:DeleteObject,
                   s3:AbortMultipartUpload, and s3:ListMultipartUploadParts
                   on the prefix. It does not need s3:CreateBucket.
                 '';
-                rank = 70;
-                ui = lib.neo.ui.mkUi {label = "AWS key file";};
+                rank = 72;
+                ui = lib.neo.ui.mkUi {label = "Secret access key";};
               };
 
               schedule = mkOption {

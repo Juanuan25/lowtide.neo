@@ -26,7 +26,7 @@
 
         ## Credentials
         - Address: `s3Uri`, for example `s3://bucket/homeserver-backups/`. That names the bucket and the folder. It is not a password.
-        - Login: `environmentFile`, a file only root can read (mode 0600, not in the Nix store). Two lines, no quotes and no `export`: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. The settings page stores the path. Do not paste the keys into settings or into chat, and do not read that file into chat.
+        - Login: `accessKeyId` and `secretAccessKey` on this service's page. Create them in AWS IAM, paste both, Activate. There is no key file. Do not repeat the secret in chat.
         - Region defaults to `eu-central-2`. It must be the bucket's region. The URI does not include it.
         - ZFS key: storage-disks keyFile (default `/root/keys/datadisk.key`). It is not in the bucket. Without a copy of it, a raw stream cannot be mounted.
 

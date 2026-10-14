@@ -49,9 +49,17 @@
           }
           {
             assertion =
-              hasPrefix "/" cfg.environmentFile
-              && !(hasPrefix "/nix/store/" cfg.environmentFile);
-            message = "neo.services.backup-glacier: environmentFile must be an absolute path outside the Nix store.";
+              cfg.accessKeyId
+              != ""
+              && builtins.match "[A-Za-z0-9]{16,128}" cfg.accessKeyId != null;
+            message = "neo.services.backup-glacier: accessKeyId must be the IAM access key ID from AWS.";
+          }
+          {
+            assertion =
+              cfg.secretAccessKey
+              != ""
+              && builtins.match "[^[:space:]\"']+" cfg.secretAccessKey != null;
+            message = "neo.services.backup-glacier: secretAccessKey must be the secret AWS showed once, one line, no quotes.";
           }
           {
             assertion = cfg.retentionDays >= classMinimum;
@@ -107,11 +115,12 @@
               if cfg.bwLimit == null || cfg.bwLimit == ""
               then ""
               else cfg.bwLimit;
+            AWS_ACCESS_KEY_ID = cfg.accessKeyId;
+            AWS_SECRET_ACCESS_KEY = cfg.secretAccessKey;
           };
           serviceConfig = {
             Type = "oneshot";
             ExecStart = script;
-            EnvironmentFile = cfg.environmentFile;
             Nice = 19;
             IOSchedulingClass = "idle";
             IOSchedulingPriority = 7;

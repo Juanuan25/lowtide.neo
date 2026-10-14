@@ -18,7 +18,7 @@ umask 077
 : "${BACKUP_GLACIER_RECURSIVE:?}"
 
 if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-  echo "backup-glacier: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set by environmentFile" >&2
+  echo "backup-glacier: set the access key ID and secret on the backup-glacier page" >&2
   exit 1
 fi
 
